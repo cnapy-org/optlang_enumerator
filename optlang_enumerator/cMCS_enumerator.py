@@ -1,7 +1,7 @@
 import numpy
 import scipy
 import optlang.glpk_interface
-from optlang.symbolics import add
+from optlang.symbolics import add, Zero
 from optlang.exceptions import IndicatorConstraintsNotSupported
 from swiglpk import glp_write_lp
 try:
@@ -33,15 +33,17 @@ class ConstrainedMinimalCutSetsEnumerator:
         # implements only combined_z which implies reduce_constraints=True
         # knock_in not yet implemented
         self.ref_set = ref_set # optional set of reference MCS for debugging
+        if not isinstance(st, scipy.sparse.lil_matrix):
+            st = scipy.sparse.lil_matrix(st)
         self._optlang_interface = optlang_interface
-        self.model = optlang_interface.Model()
+        self.model: optlang_interface.Model = optlang_interface.Model()
         self.model.configuration.presolve = True # presolve on
         # without presolve CPLEX sometimes gives false results when using indicators ?!?
         self.model.configuration.lp_method = 'auto'
         self.Constraint = optlang_interface.Constraint
         if bigM <= 0 and self.Constraint._INDICATOR_CONSTRAINT_SUPPORT is False:
-            raise IndicatorConstraintsNotSupported("This solver does not support indicators. Please choose a differen solver or use a big M formulation.")
-        self.optlang_variable_class = optlang_interface.Variable
+            raise IndicatorConstraintsNotSupported("This solver does not support indicators. Please choose a different solver or use a big M formulation.")
+        self.Variable = optlang_interface.Variable
         irr = [not r for r in reversible]
         self.num_reac = len(reversible)
         if cuts is None:
@@ -65,13 +67,13 @@ class ConstrainedMinimalCutSetsEnumerator:
             dual_rev_neg_idx = [i for i in range(self.num_reac, self.num_reac + len(split_v_idx))]
             dual_rev_neg_idx_map = [None] * self.num_reac
             for i in range(len(split_v_idx)):
-                dual_rev_neg_idx_map[split_v_idx[i]]= dual_rev_neg_idx[i];
+                dual_rev_neg_idx_map[split_v_idx[i]]= dual_rev_neg_idx[i]
         else:
             split_v_idx = []
 
         self.zero_objective= optlang_interface.Objective(0, direction='min', name='zero_objective')
         self.model.objective= self.zero_objective
-        self.z_vars = [self.optlang_variable_class("Z"+str(i), type="binary", problem=self.model.problem) for i in range(self.num_reac)]
+        self.z_vars = [self.Variable("Z"+str(i), type="binary", problem=self.model.problem) for i in range(self.num_reac)]
         self.model.add(self.z_vars)
         self.model.update() # cannot change bound below without this
         for i in irrepressible:
@@ -85,7 +87,7 @@ class ConstrainedMinimalCutSetsEnumerator:
             for k in range(num_targets):
                 z_local[k] = self.z_vars
             # for k in range(num_targets):
-            #     z_local[k] = [self.optlang_variable_class("Z"+str(k)+"_"+str(i), type="binary", problem=self.model.problem) for i in range(self.num_reac)]
+            #     z_local[k] = [self.Variable("Z"+str(k)+"_"+str(i), type="binary", problem=self.model.problem) for i in range(self.num_reac)]
             #     self.model.add(z_local[k])
             # for i in range(self.num_reac):
             #     if cuts[i]: # && ~knock_in(i) % knock-ins only use global Z, do not need local ones
@@ -118,26 +120,26 @@ class ConstrainedMinimalCutSetsEnumerator:
             for i in irrepressible:
                 dual_ub[i] = 0
             if split_reversible_v:
-                dual_vars[k] = [self.optlang_variable_class("DP"+str(k)+"_"+str(i), lb=dual_lb[i], ub=dual_ub[i]) for i in range(self.num_reac)] + \
-                    [self.optlang_variable_class("DN"+str(k)+"_"+str(i), ub=0) for i in split_v_idx]
+                dual_vars[k] = [self.Variable("DP"+str(k)+"_"+str(i), lb=dual_lb[i], ub=dual_ub[i]) for i in range(self.num_reac)] + \
+                    [self.Variable("DN"+str(k)+"_"+str(i), ub=0) for i in split_v_idx]
                 for i in irrepressible:
                     if reversible[i]: # fixes DN of irrepressible reversible reactions to 0
                          dual_vars[k][dual_rev_neg_idx_map[i]].lb = 0
             else:
-                dual_vars[k] = [self.optlang_variable_class("DR"+str(k)+"_"+str(i), lb=dual_lb[i], ub=dual_ub[i]) for i in range(self.num_reac)]
+                dual_vars[k] = [self.Variable("DR"+str(k)+"_"+str(i), lb=dual_lb[i], ub=dual_ub[i]) for i in range(self.num_reac)]
             first_w= len(dual_vars[k]) # + 1;
             if use_kn_in_dual is False:
-                dual = scipy.sparse.eye(self.num_reac, format='csr')
+                dual = scipy.sparse.eye(self.num_reac, format='lil')
                 if split_reversible_v:
-                    dual = scipy.sparse.hstack((dual, dual[:, split_v_idx]), format='csr')
-                dual = scipy.sparse.hstack((dual, st.transpose(), targets[k][0].transpose()), format='csr')
-                dual_vars[k] += [self.optlang_variable_class("DS"+str(k)+"_"+str(i)) for i in range(st.shape[0])]
+                    dual = scipy.sparse.hstack((dual, dual[:, split_v_idx]), format='lil')
+                dual = scipy.sparse.hstack((dual, st.transpose(), targets[k][0].transpose()), format='lil')
+                dual_vars[k] += [self.Variable("DS"+str(k)+"_"+str(i)) for i in range(st.shape[0])]
                 first_w += st.shape[0]
             else:
                 if split_reversible_v:
-                    dual = scipy.sparse.hstack((kn.transpose(), kn[reversible, :].transpose(), kn.transpose() @ targets[k][0].transpose()), format='csr')
+                    dual = scipy.sparse.hstack((kn.transpose(), kn[reversible, :].transpose(), kn.transpose() @ targets[k][0].transpose()), format='lil')
                 else:
-                    dual = scipy.sparse.hstack((kn.transpose(), kn.transpose() @ targets[k][0].transpose()), format='csr')
+                    dual = scipy.sparse.hstack((kn.transpose(), kn.transpose() @ targets[k][0].transpose()), format='lil')
                 #       switch split_level
                 #         case 1 % split dual vars associated with reversible reactions
                 #           dual= [kn', kn(~irr, :)', kn'*T{k}'];
@@ -145,24 +147,19 @@ class ConstrainedMinimalCutSetsEnumerator:
                 #           dual= [kn', kn', kn'*T{k}'];
                 #         otherwise % no splitting
                 #           dual= [kn', kn'*T{k}'];
-            dual_vars[k] += [self.optlang_variable_class("DT"+str(k)+"_"+str(i), lb=0) for i in range(targets[k][0].shape[0])]
+            # dual: scipy.sparse.lil_matrix = scipy.sparse.lil_matrix(dual)
+            dual_vars[k] += [self.Variable("DT"+str(k)+"_"+str(i), lb=0) for i in range(targets[k][0].shape[0])]
             self.model.add(dual_vars[k])
-            # num_dual_cols[k]= dual.shape[1]
-            constr= [None] * (dual.shape[0]+1)
-            # print(dual_vars[k][first_w:])
-            expr = mcs_computation.matrix_row_expressions(dual, dual_vars[k])
-            # print(expr)
-            for i in range(dual.shape[0]):
-                if irrev_geq and irr[i]:
-                    ub = None
-                else:
-                    ub = 0
-                #expr = add([cf * var for cf, var in zip(dual[i, :], dual_vars[k]) if cf != 0])
-                #expr = add([dual[i, k] *  dual_vars[k] for k in dual[i, :].nonzero()[1]])
-                constr[i] = self.Constraint(expr[i], lb=0, ub=ub, name="D"+str(k)+"_"+str(i), sloppy=True)
-            expr = add([cf * var for cf, var in zip(targets[k][1], dual_vars[k][first_w:]) if cf != 0])
-            constr[-1] = self.Constraint(expr, ub=-threshold, name="DW"+str(k), sloppy=True)
+            dual_vars[k] = numpy.array(dual_vars[k], dtype=object)
+            constr= [self.Constraint(Zero, lb=0, ub= None if irrev_geq and irr[i] else 0, name="D"+str(k)+"_"+str(i), sloppy=True) for i in range(dual.shape[0])]
             self.model.add(constr)
+            self.model.update()
+            for i in range(dual.shape[0]):
+                constr[i].set_linear_coefficients({var: cf for var, cf in zip(dual_vars[k][dual.rows[i]], dual.data[i])})
+            constr = self.Constraint(Zero, ub=-threshold, name="DW"+str(k), sloppy=True)
+            self.model.add(constr)
+            self.model.update()
+            constr.set_linear_coefficients({var: cf for cf, var in zip(targets[k][1], dual_vars[k][first_w:]) if cf != 0})
 
             # constraints for the target(s) (cuts and knock-ins)
             if bigM > 0:
@@ -233,40 +230,64 @@ class ConstrainedMinimalCutSetsEnumerator:
             # desired[l][0]: D, desired[l][1]: d 
             flux_lb = desired[l][2]
             flux_ub = desired[l][3]
-            self.flux_vars[l]= [self.optlang_variable_class("R"+str(l)+"_"+str(i),
+            self.flux_vars[l]= numpy.array([self.Variable("R"+str(l)+"_"+str(i),
                                 lb=flux_lb[i], ub=flux_ub[i],
-                                problem=self.model.problem) for i in range(self.num_reac)]
+                                problem=self.model.problem) for i in range(self.num_reac)])
             self.model.add(self.flux_vars[l])
-            expr = mcs_computation.matrix_row_expressions(st, self.flux_vars[l])
-            constr= [None]*st.shape[0]
+            self.model.update()
+            constr = [self.Constraint(Zero, lb=0, ub=0, name="M"+str(l)+"_"+str(i), sloppy=True) for i in range(st.shape[0])]
+            self.model.add(constr)
+            self.model.update()
+            print(st.shape, len(self.flux_vars[l]))
             for i in range(st.shape[0]):
-                constr[i] = self.Constraint(expr[i], lb=0, ub=0, name="M"+str(l)+"_"+str(i), sloppy=True)
+                print(i, st.rows[i], st.data[i])
+                constr[i].set_linear_coefficients({var: cf for var, cf in zip(self.flux_vars[l][st.rows[i]], st.data[i])})
+            if isinstance(desired[l][0], scipy.sparse.lil_matrix):
+                des = desired[l][0]
+            else:
+                des = scipy.sparse.lil_matrix(desired[l][0])
+            constr= [self.Constraint(Zero, ub=desired[l][1][i], name="DES"+str(l)+"_"+str(i), sloppy=True) for i in range(des.shape[0])]
             self.model.add(constr)
-            expr = mcs_computation.matrix_row_expressions(desired[l][0], self.flux_vars[l])
-            constr= [None]*desired[l][0].shape[0]
-            for i in range(desired[l][0].shape[0]):
-                constr[i] = self.Constraint(expr[i], ub=desired[l][1][i], name="DES"+str(l)+"_"+str(i), sloppy=True)
-            self.model.add(constr)
+            self.model.update()
+            for i in range(des.shape[0]):
+                constr[i].set_linear_coefficients({var: cf for var, cf in zip(self.flux_vars[l][des.rows[i]], des.data[i])})
 
-            for i in numpy.where(cuts)[0]:
-                if flux_ub[i] != 0: # a repressible (non_essential) reacion must have flux_ub >= 0
-                    # self.flux_vars[l][i] <= (1 - self.z_vars[i]) * flux_ub[i]
-                    self.model.add(self.Constraint(
-                      self.flux_vars[l][i] + flux_ub[i]*self.z_vars[i], ub=flux_ub[i],
-                      name= self.flux_vars[l][i].name+self.z_vars[i].name+"UB"))
-                if flux_lb[i] != 0: # a repressible (non_essential) reacion must have flux_ub >= 0
-                    # self.flux_vars[l][i] >= (1 - self.z_vars[i]) * flux_lb[i]
-                    self.model.add(self.Constraint(
-                      self.flux_vars[l][i] + flux_lb[i]*self.z_vars[i], lb=flux_lb[i],
-                      name= self.flux_vars[l][i].name+self.z_vars[i].name+"LB"))
-            #         for i= knock_in_idx
-            #           if flux_ub{l}(i) ~= 0
-            #             lpfw.write_direct_z_flux_link(obj.z_var_names{i}, obj.flux_var_names{i, l}, flux_ub{l}(i), '<=');
-            #           end
-            #           if flux_lb{l}(i) ~= 0
-            #             lpfw.write_direct_z_flux_link(obj.z_var_names{i}, obj.flux_var_names{i, l}, flux_lb{l}(i), '>=');
-            #           end
-            #         end
+            cuts_idx = numpy.where(cuts)[0]
+            constr = [(self.Constraint(Zero, ub=flux_ub[i], name= self.flux_vars[l][i].name+self.z_vars[i].name+"UB"), i)
+                        for i in cuts_idx if flux_ub[i] != 0]
+            self.model.add([c for c,_ in constr])
+            self.model.update()
+            for c, i in constr:
+                c.set_linear_coefficients({self.flux_vars[l][i]: 1, self.z_vars[i]: flux_ub[i]})
+            constr = [(self.Constraint(Zero, lb=flux_lb[i], name= self.flux_vars[l][i].name+self.z_vars[i].name+"LB"), i)
+                        for i in cuts_idx if flux_lb[i] != 0]
+            self.model.add([c for c,_ in constr])
+            self.model.update()
+            for c, i in constr:
+                c.set_linear_coefficients({self.flux_vars[l][i]: 1, self.z_vars[i]: flux_lb[i]})
+            # for i in numpy.where(cuts)[0]:
+            #     # if flux_ub[i] != 0: # a repressible (non_essential) reacion must have flux_ub >= 0
+            #     #     # self.flux_vars[l][i] <= (1 - self.z_vars[i]) * flux_ub[i]
+            #     #     constr = self.Constraint(Zero, ub=flux_ub[i], name= self.flux_vars[l][i].name+self.z_vars[i].name+"UB")
+            #     #     # self.model.add(self.Constraint(
+            #     #     #   self.flux_vars[l][i] + flux_ub[i]*self.z_vars[i], ub=flux_ub[i],
+            #     #     #   name= self.flux_vars[l][i].name+self.z_vars[i].name+"UB"))
+            #     #     self.model.add(constr)
+            #     #     self.model.update()
+            #     #     constr.set_linear_coefficients({self.flux_vars[l][i]: 1, self.z_vars[i]: flux_ub[i]})
+            #     if flux_lb[i] != 0: # a repressible (non_essential) reacion must have flux_ub >= 0
+            #         # self.flux_vars[l][i] >= (1 - self.z_vars[i]) * flux_lb[i]
+            #         self.model.add(self.Constraint(
+            #           self.flux_vars[l][i] + flux_lb[i]*self.z_vars[i], lb=flux_lb[i],
+            #           name= self.flux_vars[l][i].name+self.z_vars[i].name+"LB"))
+            # #         for i= knock_in_idx
+            # #           if flux_ub{l}(i) ~= 0
+            # #             lpfw.write_direct_z_flux_link(obj.z_var_names{i}, obj.flux_var_names{i, l}, flux_ub{l}(i), '<=');
+            # #           end
+            # #           if flux_lb{l}(i) ~= 0
+            # #             lpfw.write_direct_z_flux_link(obj.z_var_names{i}, obj.flux_var_names{i, l}, flux_lb{l}(i), '>=');
+            # #           end
+            # #         end
         
         self.evs_sz_lb = 0
         self.evs_sz = self.Constraint(add(self.z_vars), lb=self.evs_sz_lb, name='evs_sz')
