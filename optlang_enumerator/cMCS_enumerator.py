@@ -1,5 +1,6 @@
 import numpy
 import scipy
+import cobra
 import optlang.glpk_interface
 from optlang.symbolics import add, Zero
 from optlang.exceptions import IndicatorConstraintsNotSupported
@@ -52,6 +53,7 @@ class ConstrainedMinimalCutSetsEnumerator:
         else:
             irrepressible = numpy.where(cuts == False)[0]
             #iv_cost(irrepressible)= 0;
+        cuts_idx = numpy.where(cuts)[0]
         if desired is None:
             desired = []
         num_targets = len(targets)
@@ -78,7 +80,8 @@ class ConstrainedMinimalCutSetsEnumerator:
         self.model.update() # cannot change bound below without this
         for i in irrepressible:
             self.z_vars[i].ub = 0 # only if it is not a knock-in (not yet supported)
-        self.minimize_sum_over_z= optlang_interface.Objective(add(self.z_vars), direction='min', name='minimize_sum_over_z')
+        # minimize_sum_over_z needs to use an abstract expression because this objective is not automatically associated with a model
+        self.minimize_sum_over_z = optlang_interface.Objective(add(self.z_vars), direction='min', name='minimize_sum_over_z')
         z_local = [None] * num_targets
         if num_targets == 1:
             z_local[0] = self.z_vars # global and local Z are the same if there is only one target
@@ -96,7 +99,6 @@ class ConstrainedMinimalCutSetsEnumerator:
             #             name= "ZL"+str(i)))
 
         dual_vars = [None] * num_targets
-        # num_dual_cols = [0] * num_targets
         for k in range(num_targets):
             # !! unboundedness is only properly represented by None with optlang; using inifinity may cause trouble !!
             dual_lb = [None] * self.num_reac # optlang interprets None as Inf
@@ -140,14 +142,6 @@ class ConstrainedMinimalCutSetsEnumerator:
                     dual = scipy.sparse.hstack((kn.transpose(), kn[reversible, :].transpose(), kn.transpose() @ targets[k][0].transpose()), format='lil')
                 else:
                     dual = scipy.sparse.hstack((kn.transpose(), kn.transpose() @ targets[k][0].transpose()), format='lil')
-                #       switch split_level
-                #         case 1 % split dual vars associated with reversible reactions
-                #           dual= [kn', kn(~irr, :)', kn'*T{k}'];
-                #         case 2 % split all dual vars which are associated with reactions into DN <= 0, DP >= 0
-                #           dual= [kn', kn', kn'*T{k}'];
-                #         otherwise % no splitting
-                #           dual= [kn', kn'*T{k}'];
-            # dual: scipy.sparse.lil_matrix = scipy.sparse.lil_matrix(dual)
             dual_vars[k] += [self.Variable("DT"+str(k)+"_"+str(i), lb=0) for i in range(targets[k][0].shape[0])]
             self.model.add(dual_vars[k])
             dual_vars[k] = numpy.array(dual_vars[k], dtype=object)
@@ -163,17 +157,21 @@ class ConstrainedMinimalCutSetsEnumerator:
 
             # constraints for the target(s) (cuts and knock-ins)
             if bigM > 0:
-                for i in range(self.num_reac):
-                    if cuts[i]:
-                        self.model.add(self.Constraint(dual_vars[k][i] - bigM*z_local[k][i],
-                                       ub=0, name=z_local[k][i].name+dual_vars[k][i].name))
-                        if reversible[i]:
-                            if split_reversible_v:
-                                dn = dual_vars[k][dual_rev_neg_idx_map[i]]
-                            else:
-                                dn = dual_vars[k][i]
-                            self.model.add(self.Constraint(dn + bigM*z_local[k][i],
-                                           lb=0, name=z_local[k][i].name+dn.name+"r"))
+                constr = [(self.Constraint(Zero, ub=0, name=z_local[k][i].name+dual_vars[k][i].name), i) for i in cuts_idx]
+                self.model.add([c for c,_ in constr])
+                self.model.update()
+                for c, i in constr:
+                    c.set_linear_coefficients({dual_vars[k][i]: 1.0, z_local[k][i]: -bigM})
+                constr = [(self.Constraint(Zero, lb=0), i) for i in cuts_idx if reversible[i]]
+                self.model.add([c for c,_ in constr])
+                self.model.update()
+                for c, i in constr:
+                    if split_reversible_v:
+                        dn = dual_vars[k][dual_rev_neg_idx_map[i]]
+                    else:
+                        dn = dual_vars[k][i]
+                    c.name = z_local[k][i].name+dn.name+"r"
+                    c.set_linear_coefficients({dn: 1.0, z_local[k][i]: bigM})
                 #         if knock_in(i)
                 #           lpfw.write_z_flux_link(obj.z_var_names{i}, dual_var_names{k}{i}, bigM, '<=');
                 #           if ~irr(i)
@@ -238,9 +236,7 @@ class ConstrainedMinimalCutSetsEnumerator:
             constr = [self.Constraint(Zero, lb=0, ub=0, name="M"+str(l)+"_"+str(i), sloppy=True) for i in range(st.shape[0])]
             self.model.add(constr)
             self.model.update()
-            print(st.shape, len(self.flux_vars[l]))
             for i in range(st.shape[0]):
-                print(i, st.rows[i], st.data[i])
                 constr[i].set_linear_coefficients({var: cf for var, cf in zip(self.flux_vars[l][st.rows[i]], st.data[i])})
             if isinstance(desired[l][0], scipy.sparse.lil_matrix):
                 des = desired[l][0]
@@ -252,7 +248,6 @@ class ConstrainedMinimalCutSetsEnumerator:
             for i in range(des.shape[0]):
                 constr[i].set_linear_coefficients({var: cf for var, cf in zip(self.flux_vars[l][des.rows[i]], des.data[i])})
 
-            cuts_idx = numpy.where(cuts)[0]
             constr = [(self.Constraint(Zero, ub=flux_ub[i], name= self.flux_vars[l][i].name+self.z_vars[i].name+"UB"), i)
                         for i in cuts_idx if flux_ub[i] != 0]
             self.model.add([c for c,_ in constr])
@@ -265,44 +260,24 @@ class ConstrainedMinimalCutSetsEnumerator:
             self.model.update()
             for c, i in constr:
                 c.set_linear_coefficients({self.flux_vars[l][i]: 1, self.z_vars[i]: flux_lb[i]})
-            # for i in numpy.where(cuts)[0]:
-            #     # if flux_ub[i] != 0: # a repressible (non_essential) reacion must have flux_ub >= 0
-            #     #     # self.flux_vars[l][i] <= (1 - self.z_vars[i]) * flux_ub[i]
-            #     #     constr = self.Constraint(Zero, ub=flux_ub[i], name= self.flux_vars[l][i].name+self.z_vars[i].name+"UB")
-            #     #     # self.model.add(self.Constraint(
-            #     #     #   self.flux_vars[l][i] + flux_ub[i]*self.z_vars[i], ub=flux_ub[i],
-            #     #     #   name= self.flux_vars[l][i].name+self.z_vars[i].name+"UB"))
-            #     #     self.model.add(constr)
-            #     #     self.model.update()
-            #     #     constr.set_linear_coefficients({self.flux_vars[l][i]: 1, self.z_vars[i]: flux_ub[i]})
-            #     if flux_lb[i] != 0: # a repressible (non_essential) reacion must have flux_ub >= 0
-            #         # self.flux_vars[l][i] >= (1 - self.z_vars[i]) * flux_lb[i]
-            #         self.model.add(self.Constraint(
-            #           self.flux_vars[l][i] + flux_lb[i]*self.z_vars[i], lb=flux_lb[i],
-            #           name= self.flux_vars[l][i].name+self.z_vars[i].name+"LB"))
-            # #         for i= knock_in_idx
-            # #           if flux_ub{l}(i) ~= 0
-            # #             lpfw.write_direct_z_flux_link(obj.z_var_names{i}, obj.flux_var_names{i, l}, flux_ub{l}(i), '<=');
-            # #           end
-            # #           if flux_lb{l}(i) ~= 0
-            # #             lpfw.write_direct_z_flux_link(obj.z_var_names{i}, obj.flux_var_names{i, l}, flux_lb{l}(i), '>=');
-            # #           end
-            # #         end
+            #         for i= knock_in_idx
+            #           if flux_ub{l}(i) ~= 0
+            #             lpfw.write_direct_z_flux_link(obj.z_var_names{i}, obj.flux_var_names{i, l}, flux_ub{l}(i), '<=');
+            #           end
+            #           if flux_lb{l}(i) ~= 0
+            #             lpfw.write_direct_z_flux_link(obj.z_var_names{i}, obj.flux_var_names{i, l}, flux_lb{l}(i), '>=');
+            #           end
+            #         end
         
         self.evs_sz_lb = 0
-        self.evs_sz = self.Constraint(add(self.z_vars), lb=self.evs_sz_lb, name='evs_sz')
+        self.evs_sz = self.Constraint(Zero, lb=self.evs_sz_lb, name='evs_sz')
         self.model.add(self.evs_sz)
-        self.model.update() # transfer the model to the solver
+        self.model.update()
+        self.evs_sz.set_linear_coefficients({z: 1.0 for z in self.z_vars})
 
     def single_solve(self):
         status = self.model._optimize() # raw solve without any retries
         self.model._status = status # needs to be set when using _optimize
-        #self.model.problem.parameters.reset() # CPLEX raw
-        #self.model.problem.solve() # CPLEX raw
-        #cplex_status = self.model.problem.solution.get_status() # CPLEX raw
-        #self.model._status = optlang.cplex_interface._CPLEX_STATUS_TO_STATUS[cplex_status] # CPLEX raw
-        #status = self.model.status
-        #if self.model.problem.solution.get_status_string() == 'integer optimal solution': # CPLEX raw
         if status is optlang.interface.OPTIMAL or status is optlang.interface.FEASIBLE:
             print("Found solution with objective value", self.model.objective.value)
             z_idx= tuple(i for zv, i in zip(self.z_vars, range(len(self.z_vars))) if round(zv.primal))
@@ -316,12 +291,13 @@ class ConstrainedMinimalCutSetsEnumerator:
             return None
 
     def add_exclusion_constraint(self, mcs):
-        expression = add([self.z_vars[i] for i in mcs])
-        ub = len(mcs) - 1
-        self.model.add(self.Constraint(expression, ub=ub, sloppy=True))
+        constr = self.Constraint(Zero, ub=len(mcs) - 1.0, sloppy=True)
+        self.model.add(constr)
+        self.model.update()
+        constr.set_linear_coefficients({self.z_vars[i]: 1.0 for i in mcs})
 
-    def enumerate_mcs(self, max_mcs_size=None, max_mcs_num=float('inf'), enum_method=1, timeout=None,
-                        model=None, targets=None, desired=None, info=None) -> Tuple[List[Union[Tuple[int], FrozenSet[int]]], int]:
+    def enumerate_mcs(self, max_mcs_size: int=None, max_mcs_num=float('inf'), enum_method: int=1, timeout=None,
+                        model: cobra.Model=None, targets=None, desired=None, info=None) -> Tuple[List[Union[Tuple[int], FrozenSet[int]]], int]:
         # model is the metabolic network, not the MILP
         # returns a list of sorted tuples (enum_method 1-3) or a list of frozensets (enum_method 4)
         # if a dictionary is passed as info some status/runtime information is stored in there
@@ -443,11 +419,14 @@ class ConstrainedMinimalCutSetsEnumerator:
                         if cplex_status is SolutionStatus.MIP_optimal or cplex_status is SolutionStatus.optimal_populated_tolerance:
                             self.evs_sz_lb += 1
                             print("Increased MCS size to:", self.evs_sz_lb)
-                        for i in range(self.model.problem.solution.pool.get_num()):
-                            mcs = tuple(numpy.where(numpy.round(
-                                        self.model.problem.solution.pool.get_values(i, z_idx)))[0])
-                            self.add_exclusion_constraint(mcs)
-                            all_mcs.append(mcs)
+                        num_new_mcs = self.model.problem.solution.pool.get_num()
+                        new_mcs = [None] * num_new_mcs
+                        for i in range(num_new_mcs):
+                            new_mcs[i] = tuple(numpy.where(numpy.round(
+                                           self.model.problem.solution.pool.get_values(i, z_idx)))[0])
+                        for i in range(num_new_mcs):
+                            self.add_exclusion_constraint(new_mcs[i])
+                        all_mcs += new_mcs
                         self.model.update() # needs to be done explicitly when not using optlang optimize
                     elif cplex_status is SolutionStatus.MIP_infeasible:
                         print('No MCS of size ', self.evs_sz_lb)
@@ -478,12 +457,15 @@ class ConstrainedMinimalCutSetsEnumerator:
                         if gurobi_status is GRB.OPTIMAL:
                             self.evs_sz_lb += 1
                             print("Increased MCS size to:", self.evs_sz_lb)
-                        for i in range(self.model.problem.SolCount):
+                        num_new_mcs = self.model.problem.SolCount
+                        new_mcs = [None] * num_new_mcs
+                        for i in range(num_new_mcs):
                             self.model.problem.Params.SolutionNumber = i
-                            mcs = tuple(numpy.nonzero(numpy.round(
-                                        self.model.problem.getAttr(GRB.attr.Xn, z_vars)))[0])
-                            self.add_exclusion_constraint(mcs)
-                            all_mcs.append(mcs)
+                            new_mcs[i] = tuple(numpy.nonzero(numpy.round(
+                                            self.model.problem.getAttr(GRB.attr.Xn, z_vars)))[0])
+                        for i in range(num_new_mcs):
+                            self.add_exclusion_constraint(new_mcs[i])
+                        all_mcs += new_mcs
                         self.model.update() # needs to be done explicitly when not using optlang optimize
                     elif gurobi_status is GRB.INFEASIBLE:
                         print('No MCS of size ', self.evs_sz_lb)
