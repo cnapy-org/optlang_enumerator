@@ -53,14 +53,14 @@ ecc2_mcsF,_ = mcs_computation.compute_mcs(ecc2, ecc2_mue_target, cuts=cuts, enum
                                           include_model_bounds=False, results_cache_dir=results_cache_dir)
 print(set(ecc2_mcs) == set(ecc2_mcsF))
 
-# %% desired behaviour for cMCS calculation
+# %% define a desired behaviour for cMCS calculation
 ecc2_ethanol_desired = [[("EthEx", ">=", 1)]]
 ecc2_ethanol_desired = [mcs_computation.relations2leq_matrix(
                    mcs_computation.parse_relations(t, reac_id_symbols=mcs_computation.get_reac_id_symbols(reac_id)), reac_id)
                    for t in ecc2_ethanol_desired]
 mcs_computation.integrate_model_bounds(ecc2, ecc2_ethanol_desired)
 ecc2_ethanol_desired_constraints= mcs_computation.get_leq_constraints(ecc2, ecc2_ethanol_desired)
-for c in ecc2_ethanol_desired_constraints[0]: # print constraints that make up the first desired region
+for c in ecc2_ethanol_desired_constraints[0]: # print constraints that make up the desired region
     print(c)
 
 # %% calculate cMCS
