@@ -1,6 +1,12 @@
 import numpy
 import scipy
+from pathlib import Path
+import pickle
+import hashlib
+import pandas
 import cobra
+from cobra.io.dict import _ORDERED_OPTIONAL_REACTION_KEYS, _OPTIONAL_REACTION_ATTRIBUTES
+import optlang_enumerator.cobra_cnapy
 import optlang.glpk_interface
 from swiglpk import GLP_DUAL
 try:
@@ -225,14 +231,64 @@ def integrate_model_bounds(model, targets, desired=None):
         for i in range(len(desired)):
             desired[i] = (scipy.sparse.vstack((desired[i][0], bounds_mat), format='lil'), numpy.hstack((desired[i][1], bounds_rhs)))
 
+def compressed_model_to_dict(model):
+    global _ORDERED_OPTIONAL_REACTION_KEYS, _OPTIONAL_REACTION_ATTRIBUTES
+    subset_attributes = ["subset_rxns", "subset_stoich"]
+    _ORDERED_OPTIONAL_REACTION_KEYS += subset_attributes
+    for attr in subset_attributes:
+        _OPTIONAL_REACTION_ATTRIBUTES[attr] = []
+    try:
+        model_dict = cobra.io.model_to_dict(model)
+    except:
+        raise
+    finally:
+        _ORDERED_OPTIONAL_REACTION_KEYS = _ORDERED_OPTIONAL_REACTION_KEYS[:-len(subset_attributes)]
+        for attr in subset_attributes:
+            del _OPTIONAL_REACTION_ATTRIBUTES[attr]
+    return model_dict
+
+def flux_variability_analysis(model: optlang_enumerator.cobra_cnapy.cobra.Model, loopless=False, fraction_of_optimum=0.0,
+                              processes=None, results_cache_dir: Path=None, fva_hash=None, print_func=print):
+    # all bounds in the model must be finite because the COBRApy FVA treats unbounded results as errors
+    if results_cache_dir is not None:
+        fva_hash.update(pickle.dumps((loopless, fraction_of_optimum, model.tolerance))) # integrate solver tolerances?
+        if fraction_of_optimum > 0:
+            fva_hash.update(pickle.dumps(model.reactions.list_attr("objective_coefficient")))
+            fva_hash.update(model.objective_direction.encode())
+        file_path = results_cache_dir / (model.id+"_FVA_"+fva_hash.hexdigest())
+        fva_result = None
+        if Path.exists(file_path):
+            try:
+                fva_result = pandas.read_pickle(file_path)
+                print_func("Loaded FVA result from", str(file_path))
+            except:
+                print_func("Loading FVA result from", str(file_path), "failed, running FVA.")
+        else:
+            print_func("No cached result available, running FVA...")
+        if fva_result is None:
+            fva_result = cobra.flux_analysis.flux_variability_analysis(model, reaction_list=None, loopless=loopless,
+                                                             fraction_of_optimum=fraction_of_optimum,
+                                                             pfba_factor=None, processes=processes)
+            try:
+                fva_result.to_pickle(file_path)
+                print_func("Saved FVA result to ", str(file_path))
+            except:
+                print_func("Failed to write FVA result to ", str(file_path))
+        return fva_result
+    else:
+        return cobra.flux_analysis.flux_variability_analysis(model, reaction_list=None, loopless=loopless,
+                                                             fraction_of_optimum=fraction_of_optimum,
+                                                             pfba_factor=None, processes=processes)
+
 class InfeasibleRegion(Exception):
     pass
 
 # convenience function
-def compute_mcs(model, targets, desired=None, cuts=None, enum_method=1, max_mcs_size=2, max_mcs_num=1000, timeout=600,
+def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desired=None,
+                cuts=None, enum_method=1, max_mcs_size=2, max_mcs_num=1000, timeout=600,
                 exclude_boundary_reactions_as_cuts=False, network_compression=True, fva_tolerance=1e-9,
                 include_model_bounds=True, bigM=0, mip_opt_tol=1e-6, mip_feas_tol=1e-6, mip_int_tol=1e-6,
-                set_mip_parameters_callback=None) -> List[Tuple[int]]:
+                set_mip_parameters_callback=None, results_cache_dir: Path=None) -> List[Tuple[int]]:
     # if include_model_bounds=True this function integrates non-default reaction bounds of the model into the
     # target and desired regions and directly modifies(!) these parameters
 
@@ -269,45 +325,69 @@ def compute_mcs(model, targets, desired=None, cuts=None, enum_method=1, max_mcs_
             if model.reactions[r].boundary:
                 cuts[r] = False
 
-    # get blocked reactions with glpk_exact FVA (includes those that are blocked through (0,0) bounds)
-    print("Running FVA to find blocked reactions...")
-    start_time = time.monotonic()
-    with model as fva:
-        # when include_model_bounds=False modify bounds so that only reversibilites are used?
-        # fva.solver = 'glpk_exact' # too slow for large models
-        fva.tolerance = fva_tolerance
-        fva.objective = model.problem.Objective(0.0)
-        if fva.problem.__name__ == 'optlang.glpk_interface':
-            # should emulate setting an optimality tolerance (which GLPK simplex does not have)
-            fva.solver.configuration._smcp.meth = GLP_DUAL
-            fva.solver.configuration._smcp.tol_dj = fva_tolerance
-        elif fva.problem.__name__ == 'optlang.coinor_cbc_interface':
-            fva.solver.problem.opt_tol = fva_tolerance
-        # currently unsing just 1 process is much faster than 2 or 4 ?!? not only with glpk_exact, also with CPLEX
-        # is this a Windows problem? yes, multiprocessing performance under Windows is fundamemtally poor
-        fva_res = cobra.flux_analysis.flux_variability_analysis(fva, fraction_of_optimum=0.0, processes=1)
-    print(time.monotonic() - start_time)
-    # integrate FVA bounds into model? might be helpful for compression because some reversible reactions may have become irreversible
+    compressed_model = None
+    if results_cache_dir is None:
+        fva_hash = None
+    else:
+        fva_hash = model.stoichiometry_hash_object.copy()
+        fva_hash.update(b" blocked reactions")
+        if network_compression:
+            compressed_model_hash = fva_hash.copy()
+            compressed_model_hash.update(b"subsest compression"+pickle.dumps(fva_tolerance))
+            compressed_model_file: Path = results_cache_dir / \
+                (model.id+"_subsets_compressed_"+compressed_model_hash.hexdigest())
+            if compressed_model_file.exists():
+                try:
+                    with open(compressed_model_file, "rb") as file:
+                        (compressed_model, subT) = pickle.load(file)
+                    compressed_model = cobra.io.model_from_dict(compressed_model)
+                    print("Loaded compressed model from", str(compressed_model_file))
+                except:
+                    print("Failed to load compressed model from", str(compressed_model_file))
+                    compressed_model = None
+
+    if compressed_model is None:
+        print("FVA to find blocked reactions...")
+        with model as fva: # can be skipped when a compressed model is available
+            # when include_model_bounds=False modify bounds so that only reversibilites are used?
+            # fva.solver = 'glpk_exact' # too slow for large models
+            fva.tolerance = fva_tolerance
+            fva.objective = model.problem.Objective(0.0)
+            if fva.problem.__name__ == 'optlang.glpk_interface':
+                # should emulate setting an optimality tolerance (which GLPK simplex does not have)
+                fva.solver.configuration._smcp.meth = GLP_DUAL
+                fva.solver.configuration._smcp.tol_dj = fva_tolerance
+            elif fva.problem.__name__ == 'optlang.coinor_cbc_interface':
+                fva.solver.problem.opt_tol = fva_tolerance
+            fva_res = flux_variability_analysis(fva, fraction_of_optimum=0.0, processes=1, results_cache_dir=results_cache_dir,
+                                fva_hash=fva_hash)
+
     if network_compression:
-        compr_model = model.copy() # preserve the original model
-        # integrate FVA bounds and flip reactions where necessary
-        flipped = []
-        for i in range(fva_res.values.shape[0]): # assumes the FVA results are ordered same as the model reactions
-            if abs(fva_res.values[i, 0]) > fva_tolerance: # resolve with glpk_exact?
-                compr_model.reactions[i].lower_bound = fva_res.values[i, 0]
-            else:
-                # print('LB', fva_res.index[i], fva_res.values[i, :])
-                compr_model.reactions[i].lower_bound = 0
-            if abs(fva_res.values[i, 1]) > fva_tolerance: # resolve with glpk_exact?
-                compr_model.reactions[i].upper_bound = fva_res.values[i, 1]
-            else:
-                # print('UB', fva_res.index[i], fva_res.values[i, :])
-                compr_model.reactions[i].upper_bound = 0
- 
-        subT = efmtool4cobra.compress_model_sympy(compr_model)
-        model = compr_model
-        reduced = cobra.util.array.create_stoichiometric_matrix(model, array_type='dok', dtype=numpy.object)
-        stoich_mat = efmtool4cobra.dokRatMat2lilFloatMat(reduced) # DOK does not (always?) work
+        if compressed_model is None:
+            compressed_model = model.copy() # preserve the original model
+            # integrate FVA bounds and flip reactions where necessary
+            for i in range(fva_res.values.shape[0]): # assumes the FVA results are ordered same as the model reactions
+                if abs(fva_res.values[i, 0]) > fva_tolerance: # resolve with glpk_exact?
+                    compressed_model.reactions[i].lower_bound = fva_res.values[i, 0]
+                else:
+                    compressed_model.reactions[i].lower_bound = 0
+                if abs(fva_res.values[i, 1]) > fva_tolerance: # resolve with glpk_exact?
+                    compressed_model.reactions[i].upper_bound = fva_res.values[i, 1]
+                else:
+                    compressed_model.reactions[i].upper_bound = 0
+            subT = efmtool4cobra.compress_model_sympy(compressed_model)
+            if results_cache_dir is not None:
+                try:
+                    with open(compressed_model_file, "wb") as file:
+                        pickle.dump((compressed_model_to_dict(compressed_model), subT), file)
+                    print("Saved compressed model to", str(compressed_model_file))
+                except:
+                    print("Failed to save compressed model to", str(compressed_model_file))
+        model = compressed_model
+        if results_cache_dir is not None:
+            model.set_reaction_hashes()
+            model.set_stoichiometry_hash_object()
+        stoich_mat = cobra.util.array.create_stoichiometric_matrix(model, array_type='lil')
         targets = [[T@subT, t] for T, t in targets]
         # as a result of compression empty constraints can occur (e.g. limits on reactions that turn out to be blocked)
         for i in range(len(targets)): # remove empty target constraints
@@ -315,10 +395,15 @@ def compute_mcs(model, targets, desired=None, cuts=None, enum_method=1, max_mcs_
             targets[i][0] = targets[i][0][keep, :]
             targets[i][1] = targets[i][1][keep]
         desired = [[D@subT, d] for D, d in desired]
+        if results_cache_dir is not None:
+            desired_hash_value = [None] * len(desired)
         for i in range(len(desired)): # remove empty desired constraints
             keep = numpy.any(desired[i][0], axis=1)
             desired[i][0] = desired[i][0][keep, :]
             desired[i][1] = desired[i][1][keep]
+            if results_cache_dir is not None:
+                # not optimal as it integrates the matrix type into the hash value
+                desired_hash_value[i] = hashlib.md5(pickle.dumps(desired[i])).digest()
         full_cuts = cuts # needed for MCS expansion
         cuts = numpy.any(subT[cuts, :], axis=0)
     else:
@@ -329,12 +414,13 @@ def compute_mcs(model, targets, desired=None, cuts=None, enum_method=1, max_mcs_
             if fva_res.values[i, 0] >= -fva_tolerance and fva_res.values[i, 1] <= fva_tolerance:
                 blocked_rxns.append(fva_res.index[i])
                 cuts[i] = False
-        print("Found", len(blocked_rxns), "blocked reactions:\n", blocked_rxns) # FVA may not be worth it without compression
+        print("Found", len(blocked_rxns), "blocked reactions:\n", blocked_rxns)
 
     rev = [r.lower_bound < 0 for r in model.reactions] # use this as long as there might be irreversible backwards only reactions
     # add FVA bounds for desired
     desired_constraints= get_leq_constraints(model, desired)
-    print("Running FVA for desired regions...")
+    if len(desired) > 0:
+        print("Running FVA for desired regions...")
     for i in range(len(desired)):
         with model as fva_desired:
             fva_desired.tolerance = fva_tolerance
@@ -345,15 +431,19 @@ def compute_mcs(model, targets, desired=None, cuts=None, enum_method=1, max_mcs_
                 fva_desired.solver.configuration._smcp.tol_dj = fva_tolerance
             elif fva_desired.problem.__name__ == 'optlang.coinor_cbc_interface':
                 fva_desired.solver.problem.opt_tol = fva_tolerance
-            fva_desired.add_cons_vars(desired_constraints[i])
-            fva_res = cobra.flux_analysis.flux_variability_analysis(fva_desired, fraction_of_optimum=0.0, processes=1)
+            fva_desired.add_cons_vars(desired_constraints[i]) # need hash for this
+            if results_cache_dir is None:
+                fva_hash = None
+            else:
+                fva_hash = model.stoichiometry_hash_object.copy()
+                fva_hash.update(desired_hash_value[i])
+            fva_res = flux_variability_analysis(fva_desired, fraction_of_optimum=0.0, processes=1,
+                                     results_cache_dir=results_cache_dir, fva_hash=fva_hash)
             # make tiny FVA values zero
             fva_res.values[numpy.abs(fva_res.values) < fva_tolerance] = 0
             essential = numpy.where(numpy.logical_or(fva_res.values[:, 0] > fva_tolerance, fva_res.values[:, 1] < -fva_tolerance))[0]
             print(len(essential), "essential reactions in desired region", i)
             cuts[essential] = False
-            # fva_res.values[fva_res.values[:, 0] == -numpy.inf, 0] = config.lower_bound # cannot happen because cobrapy FVA does not do unbounded
-            # fva_res.values[fva_res.values[:, 1] == numpy.inf, 1] = config.upper_bound
             desired[i] = (desired[i][0], desired[i][1], fva_res.values[:, 0], fva_res.values[:, 1])
             
     optlang_interface = model.problem
