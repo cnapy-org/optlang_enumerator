@@ -1,0 +1,28 @@
+name: continuous integration tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Set up Python 3.7
+      uses: actions/setup-python@v2
+      with:
+        python-version: "3.7"
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest
+        pip install git+https://github.com/cnapy-org/efmtool_link.git#egg=efmtool_link
+        python setup.py install
+    - name: Test with pytest
+      run: |
+        pytest tests/test_metatool_example.py
