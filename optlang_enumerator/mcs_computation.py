@@ -77,7 +77,7 @@ def leq_constraints(optlang_constraint_class, row_expressions, rhs):
 def check_mcs(model, constr, mcs, expected_status, flux_expr=None):
     # if flux_expr is None:
     #     flux_expr = [r.flux_expression for r in model.reactions]
-    check_ok= numpy.zeros(len(mcs), dtype=numpy.bool)
+    check_ok= numpy.zeros(len(mcs), dtype=bool)
     with model as constr_model:
         constr_model.problem.Objective(0)
         if isinstance(constr[0], optlang.interface.Constraint):
@@ -330,6 +330,7 @@ def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desi
         fva_hash = None
     else:
         fva_hash = model.stoichiometry_hash_object.copy()
+        # different from regular FVA because of additional settings for GLPK/coinor-cbc
         fva_hash.update(b" blocked reactions")
         if network_compression:
             compressed_model_hash = fva_hash.copy()
