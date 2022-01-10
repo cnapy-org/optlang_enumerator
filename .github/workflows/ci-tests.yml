@@ -25,4 +25,4 @@ jobs:
         python setup.py install
     - name: Test with pytest
       run: |
-        pytest tests
+        pytest tests/test_metatool_example.py
