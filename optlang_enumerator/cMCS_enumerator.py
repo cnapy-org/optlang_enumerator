@@ -237,7 +237,8 @@ class ConstrainedMinimalCutSetsEnumerator:
             self.model.add(constr)
             self.model.update()
             for i in range(st.shape[0]):
-                constr[i].set_linear_coefficients({var: cf for var, cf in zip(self.flux_vars[l][st.rows[i]], st.data[i])})
+                if len(st.rows[i]) > 0: # in case an unused metabolite is in the model
+                    constr[i].set_linear_coefficients({var: cf for var, cf in zip(self.flux_vars[l][st.rows[i]], st.data[i])})
             if isinstance(desired[l][0], scipy.sparse.lil_matrix):
                 des = desired[l][0]
             else:

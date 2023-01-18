@@ -252,9 +252,8 @@ def flux_variability_analysis(model: optlang_enumerator.cobra_cnapy.cobra.Model,
     # all bounds in the model must be finite because the COBRApy FVA treats unbounded results as errors
     if results_cache_dir is not None:
         fva_hash.update(pickle.dumps((loopless, fraction_of_optimum, model.tolerance))) # integrate solver tolerances?
-        if fraction_of_optimum > 0:
-            fva_hash.update(pickle.dumps(model.reactions.list_attr("objective_coefficient")))
-            fva_hash.update(model.objective_direction.encode())
+        fva_hash.update(pickle.dumps(model.reactions.list_attr("objective_coefficient")))
+        fva_hash.update(model.objective_direction.encode())
         file_path = results_cache_dir / (model.id+"_FVA_"+fva_hash.hexdigest())
         fva_result = None
         if Path.exists(file_path):

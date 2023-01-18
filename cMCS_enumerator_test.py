@@ -1,7 +1,7 @@
 # exec(open('optlang_mcs_test5.py').read())
 #%%
 import cobra
-import cobra.util.array
+# import cobra.util.array
 from optlang_enumerator.cMCS_enumerator import *
 from optlang_enumerator.mcs_computation import *
 import time
@@ -12,7 +12,7 @@ import efmtool_link.efmtool_intern as efmtool_intern
 import efmtool_link.efmtool4cobra as efmtool4cobra
 import pickle
 import optlang_enumerator
-import mcs_computation
+import optlang_enumerator.cobra_cnapy
 from importlib import reload
 #%%
 reload(optlang_enumerator.cMCS_enumerator)
@@ -21,8 +21,8 @@ reload(optlang_enumerator.mcs_computation)
 from optlang_enumerator.mcs_computation import *
 
 #%%
-ex = cobra.io.read_sbml_model(r"metatool_example_no_ext.xml")
-ex.solver = 'coinor_cbc'
+ex = optlang_enumerator.cobra_cnapy.CNApyModel.read_sbml_model(r"tests/metatool_example_no_ext.xml")
+# ex.solver = 'cplex'
 stdf = cobra.util.array.create_stoichiometric_matrix(ex, array_type='DataFrame')
 rev = [r.reversibility for r in ex.reactions]
 reac_id = stdf.columns.tolist()
@@ -65,14 +65,48 @@ all(check_mcs(ex, target[0], mcs, optlang.interface.INFEASIBLE))
 # %%
 # e.model.problem.solution.MIP.get_best_objective()
 # e.model.problem.solution.MIP.get_mip_relative_gap()
-e = ConstrainedMinimalCutSetsEnumerator(optlang.cplex_interface, stdf.values, rev, target, 
+e = ConstrainedMinimalCutSetsEnumerator(optlang.gurobi_interface, stdf.values, rev, target, 
                                         bigM= 100, threshold=0.1, split_reversible_v=True, irrev_geq=True)
-e.model.problem.parameters.mip.tolerances.mipgap.set(0.99)
+# e.model.problem.parameters.mip.tolerances.mipgap.set(0.99)
+e.model.problem.Params.MipGap = 0.99
 info = dict()
 mcs3,_ = e.enumerate_mcs(max_mcs_size=5, enum_method=3, model=ex, targets=target, info=info)
 print(info)
 print(e.evs_sz_lb)
 print(set(mcs) == set(mcs3))
+
+#%%
+e = ConstrainedMinimalCutSetsEnumerator(optlang.gurobi_interface, stdf.values, rev, target, 
+                                        bigM= 100, threshold=0.1, split_reversible_v=True, irrev_geq=True)
+mcs2,_ = e.enumerate_mcs(max_mcs_size=5, enum_method=2, max_mcs_num=20, info=info)
+print(info)
+print(set(mcs) == set(mcs2))
+# %%
+e.model.configuration.verbosity = 3
+e.model.problem.Params.PoolSearchMode = 2
+e.model.problem.Params.PoolSolutions = 100
+e.evs_sz.ub = 1
+e.evs_sz_lb = 1
+e.model.problem.optimize()
+z_vars = [e.model.problem.getVarByName(z.name) for z in e.z_vars]
+print(e.model.problem.getAttr("Xn", z_vars))
+e.model.problem.Params.SolutionNumber = 1
+e.model.problem.getAttr("Xn", z_vars)
+print(e.model.problem.status)
+
+# %%
+e = ConstrainedMinimalCutSetsEnumerator(optlang.gurobi_interface, stdf.values, rev, target, 
+                                        bigM= 100, threshold=0.1, split_reversible_v=True, irrev_geq=True)
+e.model.objective = e.minimize_sum_over_z
+e.model.configuration.verbosity = 3
+z_vars = [e.model.problem.getVarByName(z.name) for z in e.z_vars]
+cut_set_cb = GUROBImakeMCSCallback(z_vars, ex, target) #, redundant_constraints=False)
+e.model.problem.Params.PoolSearchMode = 2
+e.model.problem.Params.LazyConstraints = 1 # must be activated explicitly
+def call_back_func(model, where): # encapsulating with functools.partial not accepted by Gurobi
+    cut_set_cb.invoke(model, where) # passing this directly not accepted by Gurobi
+e.model.problem.optimize(call_back_func)
+len(cut_set_cb.minimal_cut_sets)
 
 #%%
 e = ConstrainedMinimalCutSetsEnumerator(optlang.glpk_interface, stdf.values, rev, target, 
@@ -102,12 +136,12 @@ desired = [(equations_to_matrix(ex, ["-1 AspCon"]), [-1], flux_lb, flux_ub)]
 #  1000.,1000.,1000., 999. ])
 # cuts = numpy.array([ True,True,True,True,True,True,True, False,True,True,True,True
 # ,True,True,True, False,True,True,True,True,True, False, False,True])
-# e = ConstrainedMinimalCutSetsEnumerator(optlang.cplex_interface, stdf.values, rev, target,
-#                                         threshold=0.1, split_reversible_v=False, irrev_geq=False,
-#                                         desired=desired)
 e = ConstrainedMinimalCutSetsEnumerator(optlang.cplex_interface, stdf.values, rev, target,
-                                        threshold=0.1, split_reversible_v=True, irrev_geq=True,
-                                        desired=desired, SOS_constraints=True)
+                                        threshold=0.1, split_reversible_v=False, irrev_geq=False,
+                                        desired=desired)
+# e = ConstrainedMinimalCutSetsEnumerator(optlang.cplex_interface, stdf.values, rev, target,
+#                                         threshold=0.1, split_reversible_v=True, irrev_geq=True,
+#                                         desired=desired, SOS_constraints=True)
 # e.model.objective = e.minimize_sum_over_z
 # e.write_lp_file('testA')
 mcs3,_ = e.enumerate_mcs() #max_mcs_size=5)
@@ -208,8 +242,9 @@ bounds_mat, bounds_rhs = reaction_bounds_to_leq_matrix(ecc2)
 ecc2_mue_target = [(scipy.sparse.vstack((t[0], bounds_mat), format='csr'), numpy.hstack((t[1], bounds_rhs))) for t in ecc2_mue_target]
 ecc2_mue_target_constraints= get_leq_constraints(ecc2, ecc2_mue_target)
 # %%
-e = ConstrainedMinimalCutSetsEnumerator(optlang.cplex_interface, ecc2_stdf.values, [r.reversibility for r in ecc2.reactions], ecc2_mue_target,
-                                        cuts=cuts, threshold=0.1, split_reversible_v=True, irrev_geq=True)#, SOS_constraints=True)
+e = ConstrainedMinimalCutSetsEnumerator(optlang.gurobi_interface, ecc2_stdf.values, [r.reversibility for r in ecc2.reactions], ecc2_mue_target,
+                                        cuts=cuts, threshold=0.1, split_reversible_v=True, irrev_geq=True, bigM=1000)#, SOS_constraints=True)
+# %%
 # e.model.objective = e.minimize_sum_over_z
 # e.model.configuration.tolerances.feasibility = 1e-9
 # e.model.configuration.tolerances.optimality = 1e-9
@@ -218,9 +253,22 @@ e = ConstrainedMinimalCutSetsEnumerator(optlang.cplex_interface, ecc2_stdf.value
 #e.model.configuration.verbosity = 3
 e.evs_sz_lb = 1 
 info = dict()
-ecc2_mcs,_ = e.enumerate_mcs(max_mcs_size=3, enum_method=3, model=ecc2, targets=ecc2_mue_target, info=info)
+ecc2_mcs,_ = e.enumerate_mcs(max_mcs_size=3, enum_method=2, model=ecc2, targets=ecc2_mue_target, info=info)
 # ecc2_mcs,_ = e.enumerate_mcs(max_mcs_size=3, enum_method=1, info=info)
-print(info) # in this example SOS are somewhat slower than indicators
+print(len(ecc2_mcs), info) # in this example SOS are somewhat slower than indicators
+# %%
+e.evs_sz.lb = 1
+e.evs_sz.ub = 3
+e.model.objective = e.minimize_sum_over_z
+e.model.configuration.verbosity = 3
+z_vars = [e.model.problem.getVarByName(z.name) for z in e.z_vars]
+cut_set_cb = GUROBImakeMCSCallback(z_vars, ecc2, ecc2_mue_target) #, redundant_constraints=False)
+e.model.problem.Params.PoolSearchMode = 2
+e.model.problem.Params.LazyConstraints = 1 # must be activated explicitly
+def call_back_func(model, where): # encapsulating with functools.partial not accepted by Gurobi
+    cut_set_cb.invoke(model, where) # passing this directly not accepted by Gurobi
+e.model.problem.optimize(call_back_func)
+
 # %%
 e = ConstrainedMinimalCutSetsEnumerator(optlang.cplex_interface, ecc2_stdf.values, [r.reversibility for r in ecc2.reactions], ecc2_mue_target,
                                         cuts=cuts, threshold=0.1, split_reversible_v=True, irrev_geq=True)#, SOS_constraints=True)
@@ -239,6 +287,31 @@ e.evs_sz.ub = 3
 e.model.problem.populate_solution_pool()
 print(e.model.problem.solution.get_status_string(), cut_set_cb.candidate_count,
       len(set(cut_set_cb.minimal_cut_sets)))
+
+# %% MCS guessing heuristics simulation
+correct = []
+known = []
+unclear = []
+not_cs = []
+for i in range(1, len(cut_set_cb.minimal_cut_sets)-1): # assume the i-th MCS has been found
+    for j in range(0, i): # try heuristic with all previous MCS
+        common = cut_set_cb.minimal_cut_sets[i].intersection(cut_set_cb.minimal_cut_sets[j])
+        if len(common) > 0:
+            guess = (cut_set_cb.minimal_cut_sets[i].union(cut_set_cb.minimal_cut_sets[j]) - common) # or iteratively take out only 1 of the common?
+            # check that guess is not a superset of any other known MCS
+            if check_mcs(ecc2, ecc2_mue_target[0], [guess], optlang.interface.INFEASIBLE)[0]:
+                guess = frozenset(make_minimal_cut_set(ecc2, list(guess), ecc2_mue_target_constraints))
+                if guess in cut_set_cb.minimal_cut_sets[i+1:]: # check if the guess is contained in the future MCS
+                    correct.append(guess)
+                elif guess in cut_set_cb.minimal_cut_sets[:i]:
+                    known.append(guess)
+                else:
+                    unclear.append(guess) # are really larger MCS
+            else:
+                not_cs.append(guess)
+print(len(correct), len(set(correct)), len(unclear), len(set(unclear)), len(known))
+# unclear = [sorted(tuple(m)) for m in set(unclear)]
+# is_mcs = check_mcs(ecc2, ecc2_mue_target[0], unclear, optlang.interface.INFEASIBLE)
 
 # %%
 # ecc2_mcs,_ = compute_mcs(ecc2, ecc2_mue_target, [], cuts, 2, 3, 1000, 100)
@@ -597,9 +670,8 @@ for i in range(num_reac):
                 print(i, j)
 
 #%%
-iJO1366 = cobra.io.read_sbml_model(r"..\cnapy-projects\iJO1366\model.sbml")
+iJO1366 = cobra.io.read_sbml_model(r"../cnapy-projects/iJO1366/model.sbml")
 # iJO1366.solver = 'glpk_exact'
-# hash(str(cobra.io.model_to_dict(iJO1366))) # could this be used as a kind of model ID so that a compressed model can know if its parent model changed?
 # %% full FVA
 fva_tol = 1e-9
 model = iJO1366.copy()
