@@ -510,7 +510,7 @@ def equations_to_matrix(model, equations):
     dual.add_metabolites([cobra.Metabolite(r) for r in reaction_ids])
     for i in range(len(equations)):
         r = cobra.Reaction("R"+str(i)) 
-        dual.add_reaction(r)
+        dual.add_reactions([r])
         r.build_reaction_from_string('=> '+equations[i])
     dual = cobra.util.array.create_stoichiometric_matrix(dual, array_type='DataFrame')
     if numpy.all(dual.index.values == reaction_ids):
