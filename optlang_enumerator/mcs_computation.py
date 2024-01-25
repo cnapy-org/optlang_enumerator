@@ -155,14 +155,14 @@ def parse_relation(lhs : str, rhs : float, reac_id_symbols=None):
         denominator = lhs[slash+1:]
         numerator = lhs[0:slash]
         denominator = parse_expr(denominator, transformations=transformations, evaluate=False, local_dict=reac_id_symbols)
-        denominator = sympy.collect(denominator, denominator.free_symbols)
+        denominator = sympy.collect(sympy.expand(denominator), denominator.free_symbols)
         numerator = parse_expr(numerator, transformations=transformations, evaluate=False, local_dict=reac_id_symbols)
-        numerator = sympy.collect(numerator, numerator.free_symbols)
+        numerator = sympy.collect(sympy.expand(numerator), numerator.free_symbols)
         lhs = numerator - rhs*denominator
         rhs = 0
     else:
         lhs = parse_expr(lhs, transformations=transformations, evaluate=False, local_dict=reac_id_symbols)
-    lhs = sympy.collect(lhs, lhs.free_symbols, evaluate=False)
+    lhs = sympy.collect(sympy.expand(lhs), lhs.free_symbols, evaluate=False)
     
     return lhs, rhs
 
