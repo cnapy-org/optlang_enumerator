@@ -2,7 +2,7 @@ import numpy
 import scipy
 import cobra
 import optlang.glpk_interface
-from optlang.symbolics import add, Zero
+from optlang.symbolics import add, mul, Zero, Real
 from optlang.exceptions import IndicatorConstraintsNotSupported
 from swiglpk import glp_write_lp
 try:
@@ -27,12 +27,11 @@ import optlang_enumerator.mcs_computation as mcs_computation
 
 class ConstrainedMinimalCutSetsEnumerator:
     def __init__(self, optlang_interface, st, reversible, targets, kn=None, cuts=None,
-        desired=None, knock_in=None, bigM=0, threshold=1, split_reversible_v=True,
-        irrev_geq=False, ref_set= None): # reduce_constraints=True, combined_z=True
+        desired=None, knock_in_idx=frozenset(), bigM: float=0, threshold=1, split_reversible_v=True,
+        irrev_geq=False, intervention_costs = None, ref_set= None):
         # the matrices in st, targets and desired should be numpy.array or scipy.sparse (csr, csc, lil) format
-        # targets is a list of (T,t) pairs that represent T <= t
+        # targets is a list of (T, t) pairs that represent T <= t
         # implements only combined_z which implies reduce_constraints=True
-        # knock_in not yet implemented
         self.ref_set = ref_set # optional set of reference MCS for debugging
         if not isinstance(st, scipy.sparse.lil_matrix):
             st = scipy.sparse.lil_matrix(st)
@@ -45,15 +44,23 @@ class ConstrainedMinimalCutSetsEnumerator:
         if bigM <= 0 and self.Constraint._INDICATOR_CONSTRAINT_SUPPORT is False:
             raise IndicatorConstraintsNotSupported("This solver does not support indicators. Please choose a different solver or use a big M formulation.")
         self.Variable = optlang_interface.Variable
-        irr = [not r for r in reversible]
+        reversible = numpy.asarray(reversible)
+        irr = numpy.logical_not(reversible)
         self.num_reac = len(reversible)
         if cuts is None:
             cuts = numpy.full(self.num_reac, True, dtype=bool)
             irrepressible = []
         else:
             irrepressible = numpy.where(cuts == False)[0]
-            #iv_cost(irrepressible)= 0;
+        self.knock_in_idx = frozenset(knock_in_idx) # in case it was passed as list
+        knock_in_idx = list(knock_in_idx) # for numpy indexing
+        cuts[knock_in_idx] = False
+        irrepressible = set(irrepressible)
+        irrepressible.difference_update(self.knock_in_idx)
         cuts_idx = numpy.where(cuts)[0]
+        if any(reversible[knock_in_idx]):
+            raise ValueError("split_reversible_v cannot be used with reversible knock-in reactions")
+            # TODO: rectify this
         if desired is None:
             desired = []
         num_targets = len(targets)
@@ -65,7 +72,10 @@ class ConstrainedMinimalCutSetsEnumerator:
                 kn = scipy.sparse.csc_matrix(kn) # otherwise stacking for dual does not work
 
         if split_reversible_v:
-            split_v_idx = [i for i, x in enumerate(reversible) if x]
+            split_v_idx = numpy.where(reversible)[0]
+            # split_v_idx = reversible.copy()
+            # split_v_idx[knock_in_idx] = False # do not split if reaction is a knock-in
+            # split_v_idx = numpy.where(split_v_idx)[0]
             dual_rev_neg_idx = [i for i in range(self.num_reac, self.num_reac + len(split_v_idx))]
             dual_rev_neg_idx_map = [None] * self.num_reac
             for i in range(len(split_v_idx)):
@@ -79,9 +89,21 @@ class ConstrainedMinimalCutSetsEnumerator:
         self.model.add(self.z_vars)
         self.model.update() # cannot change bound below without this
         for i in irrepressible:
-            self.z_vars[i].ub = 0 # only if it is not a knock-in (not yet supported)
-        # minimize_sum_over_z needs to use an abstract expression because this objective is not automatically associated with a model
-        self.minimize_sum_over_z = optlang_interface.Objective(add(self.z_vars), direction='min', name='minimize_sum_over_z')
+            self.z_vars[i].ub = 0
+
+        # minimize_sum_over_z needs to use an abstract expression because this
+        # objective is not automatically associated with a model
+        if isinstance(intervention_costs, numpy.ndarray):
+            self.all_intervention_costs_integer = numpy.issubdtype(intervention_costs.dtype, numpy.integer) or \
+                                                  all(map(float.is_integer, intervention_costs))
+            self.minimize_sum_over_z = optlang_interface.Objective(
+                add([mul(Real(cost), zvar) for cost,zvar in zip(intervention_costs, self.z_vars)]),
+                direction='min', name='minimize_sum_over_z')
+        else:
+            self.all_intervention_costs_integer = True
+            self.minimize_sum_over_z = optlang_interface.Objective(
+                add(self.z_vars), direction='min', name='minimize_sum_over_z')
+
         z_local = [None] * num_targets
         if num_targets == 1:
             z_local[0] = self.z_vars # global and local Z are the same if there is only one target
@@ -93,7 +115,7 @@ class ConstrainedMinimalCutSetsEnumerator:
             #     z_local[k] = [self.Variable("Z"+str(k)+"_"+str(i), type="binary", problem=self.model.problem) for i in range(self.num_reac)]
             #     self.model.add(z_local[k])
             # for i in range(self.num_reac):
-            #     if cuts[i]: # && ~knock_in(i) % knock-ins only use global Z, do not need local ones
+            #     if cuts[i] and i not in self.knock_in_idx: # knock-ins only use global Z, do not need local ones
             #         self.model.add(self.Constraint(
             #             (1/num_targets - 1e-9)*add([z_local[k][i] for k in range(num_targets)]) - self.z_vars[i], ub=0,
             #             name= "ZL"+str(i)))
@@ -102,7 +124,6 @@ class ConstrainedMinimalCutSetsEnumerator:
         for k in range(num_targets):
             # !! unboundedness is only properly represented by None with optlang; using inifinity may cause trouble !!
             dual_lb = [None] * self.num_reac # optlang interprets None as Inf
-            #dual_lb = numpy.full(self.num_reac, numpy.NINF)
             dual_ub = [None] * self.num_reac
             #dual_ub = numpy.full(self.num_reac, numpy.inf) # can lead to GLPK crash when trying to otimize an infeasible MILP
             # GLPK treats infinity different than declaring unboundedness explicitly by glp_set_col_bnds ?!?
@@ -153,7 +174,10 @@ class ConstrainedMinimalCutSetsEnumerator:
             constr = self.Constraint(Zero, ub=-threshold, name="DW"+str(k), sloppy=True)
             self.model.add(constr)
             self.model.update()
-            constr.set_linear_coefficients({var: cf for cf, var in zip(targets[k][1], dual_vars[k][first_w:]) if cf != 0})
+            w_coeff = {var: cf for cf, var in zip(targets[k][1], dual_vars[k][first_w:]) if cf != 0}
+            if len(w_coeff) == 0:
+                raise ValueError(f"Target {k} contains the zero vector and therefore cannot be suppressed.\nCheck the target fromulation.")
+            constr.set_linear_coefficients(w_coeff)
 
             # constraints for the target(s) (cuts and knock-ins)
             if bigM > 0:
@@ -172,21 +196,24 @@ class ConstrainedMinimalCutSetsEnumerator:
                         dn = dual_vars[k][i]
                     c.name = z_local[k][i].name+dn.name+"r"
                     c.set_linear_coefficients({dn: 1.0, z_local[k][i]: bigM})
-                #         if knock_in(i)
-                #           lpfw.write_z_flux_link(obj.z_var_names{i}, dual_var_names{k}{i}, bigM, '<=');
-                #           if ~irr(i)
-                #             switch split_level
-                #               case 1
-                #                 dn= dual_var_names{k}{dual_rev_neg_idx_map(i)};
-                #               case 2
-                #                 dn= dual_var_names{k}{obj.num_reac+i};
-                #               otherwise
-                #                 dn= dual_var_names{k}{i};
-                #             end
-                #             lpfw.write_z_flux_link(obj.z_var_names{i}, dn, -bigM, '>=');
-                #           end
-                #         end
-                #       end
+
+                # dn <= (1-z)*bigM <=> dn <= bigM - z*bigM <=> dn + z*bigM <= bigM
+                constr = [(self.Constraint(Zero, ub=bigM, name="KI_"+z_local[k][i].name+dual_vars[k][i].name), i) for i in knock_in_idx]
+                self.model.add([c for c,_ in constr])
+                self.model.update()
+                for c, i in constr:
+                    c.set_linear_coefficients({dual_vars[k][i]: 1.0, z_local[k][i]: bigM})
+                # dn >= (z-1)*bigM <=> dn >= -bigM + z*bigM <=> dn - z*bigM >= -bigM
+                constr = [(self.Constraint(Zero, lb=-bigM), i) for i in knock_in_idx if reversible[i]]
+                self.model.add([c for c,_ in constr])
+                self.model.update()
+                for c, i in constr:
+                    if split_reversible_v:
+                        dn = dual_vars[k][dual_rev_neg_idx_map[i]]
+                    else:
+                        dn = dual_vars[k][i]
+                    c.name = "KI_"+z_local[k][i].name+dn.name+"r"
+                    c.set_linear_coefficients({dn: 1.0, z_local[k][i]: -bigM})
             else: # indicators
                 for i in range(self.num_reac):
                     if cuts[i]:
@@ -207,21 +234,18 @@ class ConstrainedMinimalCutSetsEnumerator:
                             self.model.add(self.Constraint(dual_vars[k][i], lb=lb, ub=0,
                                            indicator_variable=z_local[k][i], active_when=0,
                                            name=z_local[k][i].name+dual_vars[k][i].name))
-                #         if knock_in(i)
-                #           fprintf(lpfw_fid, '%s = 1 -> %s <= 0\n', obj.z_var_names{i}, dual_var_names{k}{i});
-                #           if ~irr(i)
-                #             switch split_level
-                #               case 1
-                #                 dn= dual_var_names{k}{dual_rev_neg_idx_map(i)};
-                #               case 2
-                #                 dn= dual_var_names{k}{obj.num_reac+i};
-                #               otherwise
-                #                 dn= dual_var_names{k}{i};
-                #             end
-                #             fprintf(lpfw_fid, '%s = 1 -> %s >= 0\n', obj.z_var_names{i}, dn);
-                #           end
-                #         end
-                #       end
+                    elif i in knock_in_idx:
+                        self.model.add(self.Constraint(dual_vars[k][i], ub=0,
+                                           indicator_variable=z_local[k][i], active_when=1,
+                                           name="KI_"+z_local[k][i].name+dual_vars[k][i].name))
+                        if reversible[i]:
+                            if split_reversible_v:
+                                dn = dual_vars[k][dual_rev_neg_idx_map[i]]
+                            else:
+                                dn = dual_vars[k][i]
+                            self.model.add(self.Constraint(dual_vars[k][i], lb=0,
+                                           indicator_variable=z_local[k][i], active_when=1,
+                                           name="KI_"+z_local[k][i].name+dual_vars[k][i].name+"r"))
 
         self.flux_vars= [None]*len(desired)
         for l in range(len(desired)):
@@ -261,20 +285,29 @@ class ConstrainedMinimalCutSetsEnumerator:
             self.model.update()
             for c, i in constr:
                 c.set_linear_coefficients({self.flux_vars[l][i]: 1, self.z_vars[i]: flux_lb[i]})
-            #         for i= knock_in_idx
-            #           if flux_ub{l}(i) ~= 0
-            #             lpfw.write_direct_z_flux_link(obj.z_var_names{i}, obj.flux_var_names{i, l}, flux_ub{l}(i), '<=');
-            #           end
-            #           if flux_lb{l}(i) ~= 0
-            #             lpfw.write_direct_z_flux_link(obj.z_var_names{i}, obj.flux_var_names{i, l}, flux_lb{l}(i), '>=');
-            #           end
-            #         end
+            # fv <= ub*z <=> fv - ub*z <= 0
+            constr = [(self.Constraint(Zero, ub=0, name="KI_"+self.flux_vars[l][i].name+self.z_vars[i].name+"UB"), i)
+                        for i in knock_in_idx if flux_ub[i] != 0]
+            self.model.add([c for c,_ in constr])
+            self.model.update()
+            for c, i in constr:
+                c.set_linear_coefficients({self.flux_vars[l][i]: 1, self.z_vars[i]: -flux_ub[i]})
+            # fv >= lb*z <=> fv - lb*z >= 0
+            constr = [(self.Constraint(Zero, lb=0, name="KI_"+self.flux_vars[l][i].name+self.z_vars[i].name+"LB"), i)
+                        for i in knock_in_idx if flux_lb[i] != 0]
+            self.model.add([c for c,_ in constr])
+            self.model.update()
+            for c, i in constr:
+                c.set_linear_coefficients({self.flux_vars[l][i]: 1, self.z_vars[i]: -flux_lb[i]})
         
         self.evs_sz_lb = 0
         self.evs_sz = self.Constraint(Zero, lb=self.evs_sz_lb, name='evs_sz')
         self.model.add(self.evs_sz)
         self.model.update()
-        self.evs_sz.set_linear_coefficients({z: 1.0 for z in self.z_vars})
+        if isinstance(intervention_costs, numpy.ndarray):
+            self.evs_sz.set_linear_coefficients({z: c for z,c in zip(self.z_vars, intervention_costs)})
+        else:
+            self.evs_sz.set_linear_coefficients({z: 1 for z in self.z_vars})
 
     def single_solve(self):
         status = self.model._optimize() # raw solve without any retries
@@ -298,12 +331,18 @@ class ConstrainedMinimalCutSetsEnumerator:
         constr.set_linear_coefficients({self.z_vars[i]: 1.0 for i in mcs})
 
     def enumerate_mcs(self, max_mcs_size: int=None, max_mcs_num=float('inf'), enum_method: int=1, timeout=None,
-                        model: cobra.Model=None, targets=None, desired=None, info=None) -> Tuple[List[Union[Tuple[int], FrozenSet[int]]], int]:
+                        model: cobra.Model=None, targets=None, desired=None, info=None,
+                        reaction_display_attr="id") -> Tuple[List[Union[Tuple[int], FrozenSet[int]]], int]:
         # model is the metabolic network, not the MILP
-        # returns a list of sorted tuples (enum_method 1-3) or a list of frozensets (enum_method 4)
+        # returns a list of tuples (enum_method 1-3) or a list of frozensets (enum_method 4)
         # if a dictionary is passed as info some status/runtime information is stored in there
         all_mcs = []
         err_val = 0
+        if enum_method != 2:
+            if model is None:
+                reaction_names = numpy.array([str(i) for i in range(self.num_reac)])
+            else:
+                reaction_names = numpy.array(model.reactions.list_attr(reaction_display_attr))
         if enum_method == 2 or enum_method == 4:
             if self._optlang_interface is not optlang.cplex_interface \
                 and self._optlang_interface is not optlang.gurobi_interface:
@@ -322,6 +361,8 @@ class ConstrainedMinimalCutSetsEnumerator:
                 self.model.problem.Params.PoolSolutions = 2000000000 # maximum value according to documentation
                 z_vars = [self.model.problem.getVarByName(z.name) for z in self.z_vars]
             if enum_method == 2:
+                if not self.all_intervention_costs_integer:
+                    raise ValueError("Enum_method 2 (populate) can only be used if all interventions costs are integer.\n")
                 print("Populate by cardinality up tp MCS size ", max_mcs_size)
                 if self._optlang_interface is optlang.cplex_interface:
                     self.model.problem.parameters.emphasis.mip.set(1) # integer feasibility
@@ -336,11 +377,13 @@ class ConstrainedMinimalCutSetsEnumerator:
                     self.model.objective = self.minimize_sum_over_z
                     print('Objective function is empty; set objective to self.minimize_sum_over_z')
                 if self._optlang_interface is optlang.cplex_interface:
-                    cut_set_cb = CPLEXmakeMCSCallback(z_idx, model, targets, desired=desired, max_mcs_num=max_mcs_num)
+                    cut_set_cb = CPLEXmakeMCSCallback(z_idx, model, targets, reaction_names, desired=desired, max_mcs_num=max_mcs_num,
+                                                      knock_in_idx=self.knock_in_idx)
                     self.model.problem.set_callback(cut_set_cb, cplex.callbacks.Context.id.candidate)
                 else: # Gurobi
                     self.model.problem.Params.LazyConstraints = 1 # must be activated explicitly
-                    cut_set_cb = GUROBImakeMCSCallback(z_vars, model, targets, desired=desired, max_mcs_num=max_mcs_num)
+                    cut_set_cb = GUROBImakeMCSCallback(z_vars, model, targets, reaction_names, desired=desired, max_mcs_num=max_mcs_num,
+                                                       knock_in_idx=self.knock_in_idx)
                     def call_back_func(model, where): # encapsulating with functools.partial not accepted by Gurobi
                         cut_set_cb.invoke(model, where) # passing this directly to optimize not accepted by Gurobi
         elif enum_method == 1 or enum_method == 3:
@@ -349,6 +392,10 @@ class ConstrainedMinimalCutSetsEnumerator:
                 print('Objective function is empty; set objective to self.minimize_sum_over_z')
             if enum_method == 3:
                 target_constraints= mcs_computation.get_leq_constraints(model, targets)
+                if len(self.knock_in_idx) > 0 and desired is not None:
+                    desired_constraints = mcs_computation.get_leq_constraints(model, desired)
+                else:
+                    desired_constraints = None
             if max_mcs_size is not None:
                 self.evs_sz.ub = max_mcs_size
         else:
@@ -383,9 +430,10 @@ class ConstrainedMinimalCutSetsEnumerator:
                         #    print(ov)
                     else: # enum_method == 3: # and self.model.status == 'feasible':
                         # query best bound and use it to update self.evs_sz_lb
-                        print("CS", mcs, end="")
-                        mcs = mcs_computation.make_minimal_cut_set(model, mcs, target_constraints)
-                        print(" -> MCS", mcs)
+                        print("CS", reaction_names[list(mcs)], end=" -> ")
+                        mcs = mcs_computation.make_minimal_intervention_set(model, mcs, target_constraints,
+                                desired_constraints=desired_constraints, knock_in_idx=self.knock_in_idx)
+                    print("MCS", reaction_names[list(mcs)])
                     self.add_exclusion_constraint(mcs)
                     self.model.update() # needs to be done explicitly when using _optimize
                     all_mcs.append(mcs)
@@ -416,7 +464,7 @@ class ConstrainedMinimalCutSetsEnumerator:
                         info['cplex_status'] = cplex_status
                         info['cplex_status_string'] = self.model.problem.solution.get_status_string()
                     if cplex_status is SolutionStatus.MIP_optimal or cplex_status is SolutionStatus.MIP_time_limit_feasible \
-                            or cplex_status is SolutionStatus.optimal_populated_tolerance: # may occur when a non-zero onjective function is set
+                            or cplex_status is SolutionStatus.optimal_populated_tolerance: # may occur when a non-zero objective function is set
                         if cplex_status is SolutionStatus.MIP_optimal or cplex_status is SolutionStatus.optimal_populated_tolerance:
                             self.evs_sz_lb += 1
                             print("Increased MCS size to:", self.evs_sz_lb)
@@ -553,17 +601,19 @@ class ConstrainedMinimalCutSetsEnumerator:
             raise NotImplementedError("Writing LP files not yet implemented for this solver.")
 
 class CPLEXmakeMCSCallback():
-    def __init__(self, z_vars_idx, model, targets, desired=None, max_mcs_num=float('inf'), redundant_constraints=True):
-        # needs max_mcs_num parameter
+    def __init__(self, z_vars_idx, model, targets, reaction_names, desired=None, knock_in_idx=frozenset(),
+                 max_mcs_num=float('inf'), redundant_constraints=True):
         self.z_vars_idx = z_vars_idx
         self.candidate_count = 0
         self.minimal_cut_sets = []
         self.model = model
         self.target_constraints= mcs_computation.get_leq_constraints(model, targets)
+        self.reaction_names = reaction_names
         if desired is None:
             self.desired_constraints = None
         else:
             self.desired_constraints = mcs_computation.get_leq_constraints(model, desired)
+        self.knock_in_idx = knock_in_idx
         self.redundant_constraints = redundant_constraints
         self.non_cut_set_candidates = 0
         self.abort_status = 0 # 1: stop because max_mcs_num is reached; -1: aborted due to excessive generation of candidates that are not cut sets
@@ -573,16 +623,18 @@ class CPLEXmakeMCSCallback():
         if context.in_candidate() and context.is_candidate_point(): # there are also candidate rays but these should not occur here
             self.candidate_count += 1
             cut_set = numpy.nonzero(numpy.round(context.get_candidate_point(self.z_vars_idx)))[0]
-            print("CS", cut_set, end="")
+            print("CS", self.reaction_names[cut_set], end="")
             if self.desired_constraints is not None:
                 for des in self.desired_constraints:
-                    if not mcs_computation.check_mcs(self.model, des, [cut_set], optlang.interface.OPTIMAL)[0]:
+                    if not mcs_computation.check_mcs(self.model, des, [cut_set], optlang.interface.OPTIMAL,
+                                                     knock_in_idx=self.knock_in_idx)[0]:
                         print(": Rejecting candidate that does not fulfill a desired behaviour.")
                         context.reject_candidate(constraints=[cplex.SparsePair([self.z_vars_idx[c] for c in cut_set], [1.0]*len(cut_set))],
                                                  senses="L", rhs=[len(cut_set)-1.0])
                         return
             for targ in self.target_constraints:
-                if not mcs_computation.check_mcs(self.model, targ, [cut_set], optlang.interface.INFEASIBLE)[0]:
+                if not mcs_computation.check_mcs(self.model, targ, [cut_set], optlang.interface.INFEASIBLE,
+                                                 knock_in_idx=self.knock_in_idx)[0]:
                     # cut_set cannot be a superset of an already identified MCS here
                     print(": Rejecting candidate that does not inhibit a target.")
                     self.non_cut_set_candidates += 1
@@ -599,15 +651,16 @@ class CPLEXmakeMCSCallback():
             cut_set_s = set(cut_set) # cut_set is an array, need set for >= comparison
             for mcs in self.minimal_cut_sets:
                 if cut_set_s >= mcs:
-                    print(" already contained as", mcs)
+                    print(" already contained as", self.reaction_names[list(mcs)])
                     not_superset = False
                     cut_set = mcs # for the lazy constraint
                     break
             if not_superset:
                 if len(cut_set) > context.get_double_info(cplex.callbacks.Context.info.best_bound):
                     # could use ceiling of best bound unless there are non-integer intervention costs
-                    cut_set = mcs_computation.make_minimal_cut_set(self.model, cut_set, self.target_constraints)
-                    print(" -> MCS", cut_set, end="")
+                    cut_set = mcs_computation.make_minimal_intervention_set(self.model, cut_set, self.target_constraints,
+                                desired_constraints=self.desired_constraints, knock_in_idx=self.knock_in_idx)
+                    print(" -> MCS", self.reaction_names[list(cut_set)], end="")
                 else:
                     print(" is MCS", end="")
                 self.minimal_cut_sets.append(frozenset(cut_set))
@@ -625,17 +678,19 @@ class CPLEXmakeMCSCallback():
                 context.reject_candidate()
 
 class GUROBImakeMCSCallback():
-    def __init__(self, z_vars, model, targets, desired=None, max_mcs_num=float('inf'), redundant_constraints=True):
-        # needs max_mcs_num parameter
+    def __init__(self, z_vars, model, targets, reaction_names, desired=None, knock_in_idx=frozenset(),
+                 max_mcs_num=float('inf'), redundant_constraints=True):
         self.z_vars = z_vars # Gurobi variables
         self.candidate_count = 0
         self.minimal_cut_sets = []
         self.model = model
         self.target_constraints= mcs_computation.get_leq_constraints(model, targets)
+        self.reaction_names = reaction_names
         if desired is None:
             self.desired_constraints = None
         else:
             self.desired_constraints = mcs_computation.get_leq_constraints(model, desired)
+        self.knock_in_idx = knock_in_idx
         self.redundant_constraints = redundant_constraints
         self.non_cut_set_candidates = 0
         self.abort_status = 0 # 1: stop because max_mcs_num is reached; -1: aborted due to excessive generation of candidates that are not cut sets
@@ -645,16 +700,18 @@ class GUROBImakeMCSCallback():
         if where == GRB.Callback.MIPSOL:
             self.candidate_count += 1
             cut_set = numpy.nonzero(numpy.round(grb_model.cbGetSolution(self.z_vars)))[0]
-            print("CS", cut_set, end="")
+            print("CS", self.reaction_names[cut_set], end="")
             if self.desired_constraints is not None:
                 for des in self.desired_constraints:
-                    if not mcs_computation.check_mcs(self.model, des, [cut_set], optlang.interface.OPTIMAL)[0]:
+                    if not mcs_computation.check_mcs(self.model, des, [cut_set], optlang.interface.OPTIMAL,
+                                                     knock_in_idx=self.knock_in_idx)[0]:
                         print(": Rejecting candidate that does not fulfill a desired behaviour.")
                         grb_model.cbLazy(LinExpr([1.0]*len(cut_set), [self.z_vars[c] for c in cut_set]),
                                                  GRB.LESS_EQUAL, len(cut_set)-1.0)
                         return
             for targ in self.target_constraints:
-                if not mcs_computation.check_mcs(self.model, targ, [cut_set], optlang.interface.INFEASIBLE)[0]:
+                if not mcs_computation.check_mcs(self.model, targ, [cut_set], optlang.interface.INFEASIBLE,
+                                                 knock_in_idx=self.knock_in_idx)[0]:
                     # cut_set cannot be a superset of an already identified MCS here
                     print(": Rejecting candidate that does not inhibit a target.")
                     self.non_cut_set_candidates += 1
@@ -668,15 +725,16 @@ class GUROBImakeMCSCallback():
             cut_set_s = set(cut_set) # cut_set is an array, need set for >= comparison
             for mcs in self.minimal_cut_sets: # is this necessary with Gurobi?
                 if cut_set_s >= mcs:
-                    print(" already contained as", mcs)
+                    print(" already contained as", self.reaction_names[list(mcs)])
                     not_superset = False
                     cut_set = mcs # for the lazy constraint
                     break
             if not_superset:
                 if len(cut_set) > grb_model.cbGet(GRB.Callback.MIPSOL_OBJBND):
                     # could use ceiling of best bound unless there are non-integer intervention costs
-                    cut_set = mcs_computation.make_minimal_cut_set(self.model, cut_set, self.target_constraints)
-                    print(" -> MCS", cut_set, end="")
+                    cut_set = mcs_computation.make_minimal_intervention_set(self.model, cut_set, self.target_constraints,
+                                desired_constraints=self.desired_constraints, knock_in_idx=self.knock_in_idx)
+                    print(" -> MCS", self.reaction_names[list(cut_set)], end="")
                 else:
                     print(" is MCS", end="")
                 self.minimal_cut_sets.append(frozenset(cut_set))

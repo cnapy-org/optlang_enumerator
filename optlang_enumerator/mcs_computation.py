@@ -23,7 +23,6 @@ except:
     optlang.coinor_cbc_interface = None # make sure this symbol is defined for type() comparisons
 import itertools
 from typing import List, Tuple, Union, Set, FrozenSet
-import time
 import sympy
 from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application
 from cobra.core.configuration import Configuration
@@ -74,9 +73,8 @@ def matrix_row_expressions(mat, vars):
 def leq_constraints(optlang_constraint_class, row_expressions, rhs):
     return [optlang_constraint_class(expr, ub=ub) for expr, ub in zip(row_expressions, rhs)]
 
-def check_mcs(model, constr, mcs, expected_status, flux_expr=None):
-    # if flux_expr is None:
-    #     flux_expr = [r.flux_expression for r in model.reactions]
+def check_mcs(model, constr, mcs, expected_status, knock_in_idx=frozenset(), flux_expr=None):
+    # mcs: list of tuples/sets
     check_ok= numpy.zeros(len(mcs), dtype=bool)
     with model as constr_model:
         constr_model.problem.Objective(0)
@@ -89,13 +87,15 @@ def check_mcs(model, constr, mcs, expected_status, flux_expr=None):
             constr_model.add_cons_vars(leq_constraints(constr_model.problem.Constraint, rexpr, constr[1]))
         for m in range(len(mcs)):
             with constr_model as KO_model:
-                for r in mcs[m]:
-                    if type(r) is str:
+                cuts = mcs[m]
+                if len(knock_in_idx): # assumes that cuts is a tuple of indices
+                    cuts = set(cuts)
+                    cuts.symmetric_difference_update(knock_in_idx) # knock out all unused knock-ins but keep the used ones
+                for r in cuts:
+                    if isinstance(r, str):
                         KO_model.reactions.get_by_id(r).knock_out()
                     else: # assume r is an index if it is not a string
                         KO_model.reactions[r].knock_out()
-                # for r in KO_model.reactions.get_by_any(mcs[m]): # get_by_any() does not accept tuple
-                #     r.knock_out()
                 KO_model.slim_optimize()
                 check_ok[m] = KO_model.solver.status == expected_status
     return check_ok
@@ -104,9 +104,6 @@ from swiglpk import glp_adv_basis # for direkt use of glp_exact, experimental on
 def make_minimal_cut_set(model, cut_set, target_constraints):
     original_bounds = [model.reactions[r].bounds for r in cut_set]
     keep_ko = [True] * len(cut_set)
-    # with model as KO_model:
-    #     for r in cut_set:
-    #         KO_model.reactions[r].knock_out()
     try:
         for r in cut_set:
             model.reactions[r].knock_out()
@@ -148,6 +145,65 @@ def make_minimal_cut_set(model, cut_set, target_constraints):
         model.solver.update() # just in case...
     return mcs
 
+def make_minimal_intervention_set(model, interventions: list, target_constraints,
+                                  desired_constraints=None, knock_in_idx=frozenset()):
+    intervention_set = set(interventions)
+    original_bounds = [model.reactions[r].bounds for r in interventions]
+    with model as KO_model:
+        for r in knock_in_idx - intervention_set: # knock-ins that are not active in this intervention set
+            # print("deactivate", r)
+            KO_model.reactions[r].knock_out()
+        keep_intervention = [True] * len(interventions)
+        try:
+            for r in intervention_set - knock_in_idx: # leave active knock-ins operational
+                if r not in knock_in_idx:
+                    # print("knock out", r)
+                    KO_model.reactions[r].knock_out()
+            for i in range(len(interventions)):
+                r = interventions[i]
+                if r in knock_in_idx:
+                    # print("Checking KI", r)
+                    is_knock_in = True
+                    KO_model.reactions[r].knock_out()
+                else:
+                    # print("Checking KO", r)
+                    is_knock_in = False
+                    KO_model.reactions[r].bounds = original_bounds[i]
+                targets_still_infeasible = True
+                for target in target_constraints:
+                    with KO_model as target_model:
+                        target_model.problem.Objective(0)
+                        target_model.add_cons_vars(target)
+                        target_model.slim_optimize()
+                        targets_still_infeasible = target_model.solver.status == optlang.interface.INFEASIBLE
+                        if not targets_still_infeasible:
+                            break
+                desired_still_feasible = True
+                if is_knock_in and desired_constraints is not None:
+                    for desired in desired_constraints:
+                        with KO_model as desired_model:
+                            desired_model.problem.Objective(0)
+                            desired_model.add_cons_vars(desired)
+                            desired_model.slim_optimize()
+                            desired_still_feasible = desired_model.solver.status == optlang.interface.OPTIMAL
+                            if not desired_still_feasible:
+                                break
+                if targets_still_infeasible and desired_still_feasible: # this intervention is redundant
+                    keep_intervention[i] = False
+                else: # this intervention is necessary
+                    if is_knock_in: # reactivate
+                        KO_model.reactions[r].bounds = original_bounds[i]
+                    else:
+                        KO_model.reactions[r].knock_out()
+            mcs = tuple(ko for(ko, keep) in zip(interventions, keep_intervention) if keep)
+        # don't handle the exception, just make sure KO_model is restored
+        finally:
+            for i in range(len(interventions)):
+                r = interventions[i]
+                KO_model.reactions[r].bounds = original_bounds[i]
+            KO_model.solver.update() # just in case...
+    return mcs
+
 def parse_relation(lhs : str, rhs : float, reac_id_symbols=None):
     transformations = (standard_transformations + (implicit_multiplication_application,))
     slash = lhs.find('/')
@@ -166,32 +222,44 @@ def parse_relation(lhs : str, rhs : float, reac_id_symbols=None):
     
     return lhs, rhs
 
-def parse_relations(relations : List, reac_id_symbols=None):
+def parse_relations(relations: list, reac_id_symbols=None):
     for r in range(len(relations)):
         lhs, rhs = parse_relation(relations[r][0], relations[r][2], reac_id_symbols=reac_id_symbols)
         relations[r] = (lhs, relations[r][1], rhs)
     return relations
 
-# def get_reac_id_symbols(model) -> dict:
-#     return {id: sympy.symbols(id) for id in model.reactions.list_attr("id")}
-
 def get_reac_id_symbols(reac_id) -> dict:
     return {rxn: sympy.symbols(rxn) for rxn in reac_id}
 
+def get_reaction_id_symbols(reactions: cobra.DictList) -> dict:
+    return {rxn: sympy.symbols(rxn.id) for rxn in reactions}
+
 def relations2leq_matrix(relations : List, variables):
-    matrix = numpy.zeros((len(relations), len(variables)))
-    rhs = numpy.zeros(len(relations))
-    for i in range(len(relations)):
-        if relations[i][1] == ">=":
+    num_inequalities = len(relations)
+    for rel in relations:
+        if rel[1] == "=":
+            num_inequalities += 1
+    matrix = numpy.zeros((num_inequalities, len(variables)))
+    rhs = numpy.zeros(num_inequalities)
+    i = 0
+    for rel in relations:
+        if rel[1] == ">=":
             f = -1.0
-        else:
+        elif rel[1] == "<=" or rel[1] == "=":
             f = 1.0
-        for r in relations[i][0].keys(): # the keys are symbols
-            matrix[i][variables.index(str(r))] = f*relations[i][0][r]
-        rhs[i] = f*relations[i][2]
+        else:
+            raise ValueError('Only "<=", ">=" and "=" relations are supported.')
+        for r,c in rel[0].items(): # the keys are symbols
+            matrix[i][variables.index(str(r))] = f*c
+        rhs[i] = f*rel[2]
+        i += 1
+        if rel[1] == "=":
+            matrix[i, :] = -matrix[i-1, :]
+            rhs[i] = -rhs[i-1]
+            i += 1
     return matrix, rhs # matrix <= rhs
 
-def get_leq_constraints(model, leq_mat : List[Tuple], flux_expr=None):
+def get_leq_constraints(model: cobra.Model, leq_mat : List[Tuple], flux_expr=None):
     # leq_mat can be either targets or desired (as matrices)
     # returns contstraints that can be added to model 
     if flux_expr is None:
@@ -250,6 +318,8 @@ def compressed_model_to_dict(model):
 def flux_variability_analysis(model: optlang_enumerator.cobra_cnapy.cobra.Model, loopless=False, fraction_of_optimum=0.0,
                               processes=None, results_cache_dir: Path=None, fva_hash=None, print_func=print):
     # all bounds in the model must be finite because the COBRApy FVA treats unbounded results as errors
+    model_stoichiometry_hash_object = model.stoichiometry_hash_object
+    model._stoichiometry_hash_object = None # in case model needs to be pickled
     if results_cache_dir is not None:
         fva_hash.update(pickle.dumps((loopless, fraction_of_optimum, model.tolerance))) # integrate solver tolerances?
         fva_hash.update(pickle.dumps(model.reactions.list_attr("objective_coefficient")))
@@ -273,30 +343,34 @@ def flux_variability_analysis(model: optlang_enumerator.cobra_cnapy.cobra.Model,
                 print_func("Saved FVA result to ", str(file_path))
             except:
                 print_func("Failed to write FVA result to ", str(file_path))
-        return fva_result
     else:
-        return cobra.flux_analysis.flux_variability_analysis(model, reaction_list=None, loopless=loopless,
+        fva_result = cobra.flux_analysis.flux_variability_analysis(model, reaction_list=None, loopless=loopless,
                                                              fraction_of_optimum=fraction_of_optimum,
                                                              pfba_factor=None, processes=processes)
+    model.restore_stoichiometry_hash_object(model_stoichiometry_hash_object)
+    return fva_result
 
 class InfeasibleRegion(Exception):
     pass
 
 # convenience function
 def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desired=None,
-                cuts=None, enum_method=1, max_mcs_size=2, max_mcs_num=1000, timeout=600,
-                exclude_boundary_reactions_as_cuts=False, network_compression=True, fva_tolerance=1e-9,
+                cuts=None, knock_in_idx=None, intervention_costs=None,
+                enum_method=1, max_mcs_size=2, max_mcs_num=1000, timeout=600,
+                exclude_boundary_reactions_as_cuts=False, network_compression:bool=True, fva_tolerance=1e-9,
                 include_model_bounds=True, bigM=0, mip_opt_tol=1e-6, mip_feas_tol=1e-6, mip_int_tol=1e-6,
                 set_mip_parameters_callback=None, results_cache_dir: Path=None) -> List[Tuple[int]]:
     # if include_model_bounds=True this function integrates non-default reaction bounds of the model into the
     # target and desired regions and directly modifies(!) these parameters
-
-    # make fva_res and compressed model optional parameters
     if desired is None:
         desired = []
+    if knock_in_idx is None:
+        knock_in_idx = []
 
-    target_constraints= get_leq_constraints(model, targets)
-    desired_constraints= get_leq_constraints(model, desired)
+    flux_expr = [r.flux_expression for r in model.reactions]
+    target_constraints = get_leq_constraints(model, targets, flux_expr=flux_expr)
+    desired_constraints = get_leq_constraints(model, desired, flux_expr=flux_expr)
+    del flux_expr
 
     # check whether all target/desired regions are feasible
     for i in range(len(targets)):
@@ -318,11 +392,18 @@ def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desi
         integrate_model_bounds(model, targets, desired)
 
     if cuts is None:
-        cuts= numpy.full(len(model.reactions), True, dtype=bool)
+        cuts = numpy.full(len(model.reactions), True, dtype=bool)
+    else:
+        cuts = numpy.asarray(cuts) # in case it was passed as list
     if exclude_boundary_reactions_as_cuts:
         for r in range(len(model.reactions)):
             if model.reactions[r].boundary:
                 cuts[r] = False
+    cuts[knock_in_idx] = False # knock-ins supersede cuts
+    intervenable = cuts.copy() # needed for MCS expansion and sorting according to cost
+    intervenable[knock_in_idx] = True
+    if intervention_costs is not None:
+        intervention_costs = numpy.asarray(intervention_costs) # in case it was passed as list
 
     compressed_model = None
     if results_cache_dir is None:
@@ -375,7 +456,9 @@ def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desi
                     compressed_model.reactions[i].upper_bound = fva_res.values[i, 1]
                 else:
                     compressed_model.reactions[i].upper_bound = 0
-            subT = efmtool4cobra.compress_model_sympy(compressed_model)
+            # rows of subT are the reactions, columns the subsets
+            print("Network compression...")
+            subT = efmtool4cobra.compress_model_sympy(compressed_model, protected_reactions=knock_in_idx)
             if results_cache_dir is not None:
                 try:
                     with open(compressed_model_file, "wb") as file:
@@ -383,7 +466,14 @@ def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desi
                     print("Saved compressed model to", str(compressed_model_file))
                 except:
                     print("Failed to save compressed model to", str(compressed_model_file))
+        model_reactions = model.reactions.list_attr("id")
         model = compressed_model
+        for r in model.reactions:
+            if len(r.subset_rxns) > 1:
+                r.subset_id = "{"+"|".join(model_reactions[i] for i in r.subset_rxns)+"}"
+            else:
+                r.subset_id = r.id
+        del model_reactions
         if results_cache_dir is not None:
             model.set_reaction_hashes()
             model.set_stoichiometry_hash_object()
@@ -404,13 +494,19 @@ def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desi
             if results_cache_dir is not None:
                 # not optimal as it integrates the matrix type into the hash value
                 desired_hash_value[i] = hashlib.md5(pickle.dumps(desired[i])).digest()
-        full_cuts = cuts # needed for MCS expansion
         cuts = numpy.any(subT[cuts, :], axis=0)
+        knock_in_idx = [numpy.where(subT[i, :])[0][0] for i in knock_in_idx]
+        if intervention_costs is not None:
+            iv_cost_uncompressed = intervention_costs
+            intervention_costs = numpy.zeros(subT.shape[1])
+            for i in range(subT.shape[1]):
+                idx = numpy.where(subT[:, i])[0]
+                if len(idx > 0):
+                    intervention_costs[i] = min(iv_cost_uncompressed[idx])
     else:
         stoich_mat = cobra.util.array.create_stoichiometric_matrix(model, array_type='lil')
         blocked_rxns = []
         for i in range(fva_res.values.shape[0]):
-            # if res.values[i, 0] == 0 and res.values[i, 1] == 0:
             if fva_res.values[i, 0] >= -fva_tolerance and fva_res.values[i, 1] <= fva_tolerance:
                 blocked_rxns.append(fva_res.index[i])
                 cuts[i] = False
@@ -455,7 +551,8 @@ def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desi
         print("Using big M.")
 
     e = cMCS_enumerator.ConstrainedMinimalCutSetsEnumerator(optlang_interface, stoich_mat, rev, targets, desired=desired,
-                                    bigM=bigM, threshold=0.1, cuts=cuts, split_reversible_v=True, irrev_geq=True)
+                                bigM=bigM, threshold=0.1, cuts=cuts, intervention_costs=intervention_costs,
+                                knock_in_idx=knock_in_idx, split_reversible_v=not network_compression, irrev_geq=True)
     if enum_method == 3:
         if optlang_interface.__name__ == 'optlang.cplex_interface':
             e.model.problem.parameters.mip.tolerances.mipgap.set(0.98)
@@ -479,16 +576,31 @@ def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desi
         e.model.configuration.tolerances.optimality = mip_opt_tol
     e.model.configuration.tolerances.feasibility = mip_feas_tol
     e.model.configuration.tolerances.integrality = mip_int_tol
-    if set_mip_parameters_callback != None:
+    if set_mip_parameters_callback is not None:
         set_mip_parameters_callback(e.model)
     mcs, err_val = e.enumerate_mcs(max_mcs_size=max_mcs_size, max_mcs_num=max_mcs_num, enum_method=enum_method,
-                            model=model, targets=targets, desired=desired, timeout=timeout)
+                            model=model, targets=targets, desired=desired, timeout=timeout,
+                            reaction_display_attr='subset_id' if network_compression else 'id')
     if network_compression:
         xsubT= subT.copy()
-        xsubT[numpy.logical_not(full_cuts), :] = 0 # only expand to reactions that are repressible within a given subset
+        xsubT[numpy.logical_not(intervenable), :] = 0 # only expand to reactions that are intervenable within a given subset
         mcs = expand_mcs(mcs, xsubT)
+        if intervention_costs is not None:
+            intervention_costs = iv_cost_uncompressed
     elif enum_method == 4:
         mcs = [tuple(sorted(m)) for m in mcs]
+
+    if intervention_costs is not None and numpy.any(intervention_costs[intervenable] != 1):
+        print("Sorting and filtering interventions according to their cost")
+        mcs = [(m, sum(intervention_costs[list(m)])) for m in mcs]
+        mcs = [(m, c) for m,c in mcs if c <= max_mcs_size]
+        mcs = sorted(mcs, key=lambda x: x[1])
+        mcs = [m for m,_ in mcs]
+    elif enum_method == 3 or enum_method == 4: # sort according to intervention size
+        mcs = sorted(mcs, key=len)
+    # if some intervention costs are 0 supersets with these interventions may or may
+    # not be present depending on the enumeration scheme
+
     return mcs, err_val
 
 def stoich_mat2cobra(stoich_mat, irrev_reac):
@@ -517,4 +629,3 @@ def equations_to_matrix(model, equations):
         return dual.values.transpose()
     else:
         raise RuntimeError("Index order was not preserved.")
-
