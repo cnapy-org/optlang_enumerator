@@ -356,7 +356,7 @@ class InfeasibleRegion(Exception):
 # convenience function
 def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desired=None,
                 cuts=None, knock_in_idx=None, intervention_costs=None,
-                enum_method=1, max_mcs_size=2, max_mcs_num=1000, timeout=600,
+                enum_method=1, max_mcs_size=2, max_mcs_num=1000, timeout=600, use_kn_in_dual=False,
                 exclude_boundary_reactions_as_cuts=False, network_compression:bool=True, fva_tolerance=1e-9,
                 include_model_bounds=True, bigM=0, mip_opt_tol=1e-6, mip_feas_tol=1e-6, mip_int_tol=1e-6,
                 set_mip_parameters_callback=None, results_cache_dir: Path=None) -> List[Tuple[int]]:
@@ -443,6 +443,7 @@ def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desi
             fva_res = flux_variability_analysis(fva, fraction_of_optimum=0.0, processes=1, results_cache_dir=results_cache_dir,
                                 fva_hash=fva_hash)
 
+    kn = None
     if network_compression:
         if compressed_model is None:
             compressed_model = model.copy() # preserve the original model
@@ -478,6 +479,9 @@ def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desi
             model.set_reaction_hashes()
             model.set_stoichiometry_hash_object()
         stoich_mat = cobra.util.array.create_stoichiometric_matrix(model, array_type='lil')
+        if use_kn_in_dual:
+            kn = efmtool4cobra.jRatMat2sparseFloat(
+                    efmtool4cobra.kernel(efmtool4cobra.get_jRatMat_stoichmat(model)))
         targets = [[T@subT, t] for T, t in targets]
         # as a result of compression empty constraints can occur (e.g. limits on reactions that turn out to be blocked)
         for i in range(len(targets)): # remove empty target constraints
@@ -550,9 +554,10 @@ def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desi
         bigM = 1000.0
         print("Using big M.")
 
-    e = cMCS_enumerator.ConstrainedMinimalCutSetsEnumerator(optlang_interface, stoich_mat, rev, targets, desired=desired,
-                                bigM=bigM, threshold=0.1, cuts=cuts, intervention_costs=intervention_costs,
-                                knock_in_idx=knock_in_idx, split_reversible_v=not network_compression, irrev_geq=True)
+    e = cMCS_enumerator.ConstrainedMinimalCutSetsEnumerator(optlang_interface, stoich_mat, rev, targets,
+            desired=desired, bigM=bigM, threshold=0.1, kn=kn,
+            cuts=cuts, intervention_costs=intervention_costs, knock_in_idx=knock_in_idx,
+            split_reversible_v=not network_compression, irrev_geq=kn is None)
     if enum_method == 3:
         if optlang_interface.__name__ == 'optlang.cplex_interface':
             e.model.problem.parameters.mip.tolerances.mipgap.set(0.98)
@@ -578,9 +583,11 @@ def compute_mcs(model: optlang_enumerator.cobra_cnapy.cobra.Model, targets, desi
     e.model.configuration.tolerances.integrality = mip_int_tol
     if set_mip_parameters_callback is not None:
         set_mip_parameters_callback(e.model)
+    #info = dict()
     mcs, err_val = e.enumerate_mcs(max_mcs_size=max_mcs_size, max_mcs_num=max_mcs_num, enum_method=enum_method,
-                            model=model, targets=targets, desired=desired, timeout=timeout,
+                            model=model, targets=targets, desired=desired, timeout=timeout, #info=info,
                             reaction_display_attr='subset_id' if network_compression else 'id')
+    #print(f"MILP time: {info['time']:.2f} seconds")
     if network_compression:
         xsubT= subT.copy()
         xsubT[numpy.logical_not(intervenable), :] = 0 # only expand to reactions that are intervenable within a given subset

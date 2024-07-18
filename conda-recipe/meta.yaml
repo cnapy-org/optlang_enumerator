@@ -1,4 +1,4 @@
-{% set version = '0.0.10' %}
+{% set version = '0.0.11' %}
 
 package:
   name: optlang_enumerator
@@ -18,7 +18,7 @@ requirements:
     - scipy
     - optlang
     - cobra>=0.26.3
-    - efmtool_link>=0.0.5
+    - efmtool_link>=0.0.6
     - sympy>=1.12
 
 
