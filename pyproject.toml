@@ -1,0 +1,18 @@
+[project]
+name = "optlang_enumerator"
+version = "0.0.12"
+authors = [
+  { name="Axel von Kamp", email="vonkamp@mpi-magdeburg.mpg.de" },
+]
+description = "Module for enumerating minimal cut sets"
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache License 2.0",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/cnapy-org/optlang_enumerator"
+Issues = "https://github.com/cnapy-org/optlang_enumerator/issues"
