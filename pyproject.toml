@@ -9,9 +9,10 @@ readme = "README.md"
 requires-python = ">=3.7"
 classifiers = [
     "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
 ]
-dynamic = ["license", "dependencies"]
+dependencies = ["numpy==1.23", "scipy", "cobra>=0.26.3", "optlang", "efmtool_link>=0.0.6", "sympy>=1.12", "swiglpk"]
 
 [project.urls]
 Homepage = "https://github.com/cnapy-org/optlang_enumerator"
