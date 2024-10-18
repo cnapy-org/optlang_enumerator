@@ -1,6 +1,6 @@
 [project]
 name = "optlang_enumerator"
-version = "0.0.12"
+version = "0.0.13"
 authors = [
   { name="Axel von Kamp", email="vonkamp@mpi-magdeburg.mpg.de" },
 ]
