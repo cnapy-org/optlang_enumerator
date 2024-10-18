@@ -6,13 +6,17 @@ authors = [
 ]
 description = "Module for enumerating minimal cut sets"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
 ]
-dependencies = ["numpy==1.23", "scipy", "cobra>=0.26.3", "optlang", "efmtool_link>=0.0.6", "sympy>=1.12", "swiglpk"]
+dependencies = ["numpy==1.23.*", "scipy", "cobra>=0.29", "optlang", "efmtool_link>=0.0.6", "sympy>=1.12", "swiglpk"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
 
 [project.urls]
 Homepage = "https://github.com/cnapy-org/optlang_enumerator"
