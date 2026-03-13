@@ -14,7 +14,7 @@ requirements:
     - python
   run:
     - python
-    - numpy=1.23
+    - numpy
     - scipy
     - optlang
     - cobra>=0.26.3
