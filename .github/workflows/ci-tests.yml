@@ -1,6 +1,7 @@
 name: continuous integration tests
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
   pull_request:
