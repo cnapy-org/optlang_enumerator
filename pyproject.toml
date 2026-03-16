@@ -12,7 +12,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
 ]
-dependencies = ["numpy==1.23.*", "scipy", "cobra>=0.29", "optlang", "efmtool_link>=0.0.6", "sympy>=1.12", "swiglpk"]
+dependencies = ["numpy", "scipy", "cobra>=0.29", "optlang", "efmtool_link>=0.0.6", "sympy>=1.12", "swiglpk"]
 
 [build-system]
 requires = ["setuptools"]
