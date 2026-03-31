@@ -1,6 +1,6 @@
 [project]
 name = "optlang_enumerator"
-version = "0.0.13"
+version = "0.0.15"
 authors = [
   { name="Axel von Kamp", email="vonkamp@mpi-magdeburg.mpg.de" },
 ]
@@ -12,7 +12,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
 ]
-dependencies = ["numpy", "scipy", "cobra>=0.29", "optlang", "efmtool_link>=0.0.6", "sympy>=1.12", "swiglpk"]
+dependencies = ["numpy", "scipy", "cobra>=0.30", "optlang", "efmtool_link>=0.0.9", "sympy>=1.12", "swiglpk"]
 
 [build-system]
 requires = ["setuptools"]
